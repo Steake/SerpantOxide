@@ -8,12 +8,14 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Modifier},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, List, ListItem, Clear, Wrap},
     Terminal,
 };
 use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
+use serde_json::json;
 
 use tokio::sync::RwLock;
 use crate::graph::ShadowGraph;
@@ -49,6 +51,43 @@ pub async fn run_tui(
     let mut show_model_popup = false;
     let mut popup_query = String::new();
     let mut popup_cursor: usize = 0;
+
+    // AI Suggestions
+    let mut suggestion_ghost = String::new();
+    let (suggest_tx, mut suggest_rx) = tokio::sync::mpsc::channel::<String>(100);
+    let (suggest_resp_tx, mut suggest_resp_rx) = tokio::sync::mpsc::channel::<String>(100);
+    
+    let engine_clone = llm_engine.clone();
+    tokio::spawn(async move {
+        let mut last_req = String::new();
+        loop {
+            let mut req = match suggest_rx.recv().await {
+                Some(r) => r,
+                None => break,
+            };
+            while let Ok(r) = suggest_rx.try_recv() { req = r; }
+            if req == last_req { continue; }
+            last_req = req.clone();
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            if !suggest_rx.is_empty() { continue; }
+
+            if !req.is_empty() {
+                let context = "User typing a pentest orchestrator prompt.";
+                if let Ok(suggestion) = engine_clone.ai_suggest_completion(&req, context).await {
+                    let _ = suggest_resp_tx.send(suggestion).await;
+                }
+            } else {
+                let _ = suggest_resp_tx.send("".to_string()).await;
+            }
+        }
+    });
+
+    // Report Mode
+    let mut active_report: Option<String> = None;
+    let mut is_generating_report = false;
+    let mut report_scroll: u16 = 0;
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::channel::<String>(2);
 
     let _commands = vec![
         "/agent", "/crew", "/se", "/evm", "/chain", "/target", "/tools",
@@ -198,9 +237,16 @@ pub async fn run_tui(
 
             // Interaction Bar (Footer)
             let prompt_border_style = if is_nav_mode { Style::default().fg(Color::DarkGray) } else { Style::default().fg(Color::Yellow) };
-            let input_para = Paragraph::new(format!("> {}", input))
-                .style(Style::default().fg(Color::Yellow))
-                .block(Block::default().borders(Borders::ALL).title(" Agent Prompt (/commands) ").border_style(prompt_border_style))
+            
+            let mut prompt_spans = vec![
+                Span::styled(format!("> {}", input), Style::default().fg(Color::Yellow)),
+            ];
+            if !suggestion_ghost.is_empty() && !is_nav_mode {
+                prompt_spans.push(Span::styled(suggestion_ghost.clone(), Style::default().fg(Color::DarkGray)));
+            }
+
+            let input_para = Paragraph::new(Line::from(prompt_spans))
+                .block(Block::default().borders(Borders::ALL).title(" Agent Prompt (Tab to complete, /commands) ").border_style(prompt_border_style))
                 .wrap(Wrap { trim: true });
             f.render_widget(input_para, chunks[3]);
 
@@ -264,6 +310,24 @@ pub async fn run_tui(
                     f.render_widget(list, area);
                 }
             }
+
+            if is_generating_report {
+                let area = centered_rect(50, 20, size);
+                f.render_widget(Clear, area);
+                let loading = Paragraph::new("Synthesizing Intelligence...\nCalling Executive Summary Agent...")
+                    .style(Style::default().fg(Color::Yellow))
+                    .block(Block::default().borders(Borders::ALL).title(" Generating Report "));
+                f.render_widget(loading, area);
+            } else if let Some(report) = &active_report {
+                let area = centered_rect(90, 90, size);
+                f.render_widget(Clear, area);
+                let report_para = Paragraph::new(report.as_str())
+                    .style(Style::default().fg(Color::White))
+                    .block(Block::default().borders(Borders::ALL).title(" Executive Intelligence Report (Arrows to scroll, ESC to close) "))
+                    .wrap(Wrap { trim: true })
+                    .scroll((report_scroll, 0));
+                f.render_widget(report_para, area);
+            }
         })?;
 
         tokio::select! {
@@ -274,17 +338,28 @@ pub async fn run_tui(
                     telemetry_scroll = logs.len().saturating_sub(10) as u16; // Auto-scroll
                 }
             }
+            Some(sug) = suggest_resp_rx.recv() => {
+                suggestion_ghost = sug;
+            }
+            Some(rep) = report_rx.recv() => {
+                is_generating_report = false;
+                active_report = Some(rep);
+                report_scroll = 0;
+            }
             Some(Ok(evt)) = reader.next() => {
                 match evt {
                     Event::Key(key) => {
                         match key.code {
                             KeyCode::Esc => {
-                                if selected_agent_id.is_some() { selected_agent_id = None; }
+                                if active_report.is_some() { active_report = None; }
+                                else if selected_agent_id.is_some() { selected_agent_id = None; }
                                 else if show_model_popup { show_model_popup = false; }
                                 else { is_nav_mode = !is_nav_mode; }
                             }
                             KeyCode::Up => {
-                                if selected_agent_id.is_some() {
+                                if active_report.is_some() {
+                                    report_scroll = report_scroll.saturating_sub(1);
+                                } else if selected_agent_id.is_some() {
                                     agent_detail_scroll = agent_detail_scroll.saturating_sub(1);
                                 } else if show_model_popup {
                                     if popup_cursor > 0 { popup_cursor -= 1; }
@@ -294,7 +369,9 @@ pub async fn run_tui(
                                 }
                             }
                             KeyCode::Down => {
-                                if selected_agent_id.is_some() {
+                                if active_report.is_some() {
+                                    report_scroll += 1;
+                                } else if selected_agent_id.is_some() {
                                     agent_detail_scroll += 1;
                                 } else if show_model_popup {
                                     // ... check count ...
@@ -318,11 +395,26 @@ pub async fn run_tui(
                             }
                             KeyCode::Char(c) => {
                                 if show_model_popup { popup_query.push(c); popup_cursor = 0; }
-                                else if !is_nav_mode { input.push(c); }
+                                else if !is_nav_mode { 
+                                    input.push(c); 
+                                    suggestion_ghost.clear();
+                                    let _ = suggest_tx.try_send(input.clone());
+                                }
                             },
                             KeyCode::Backspace => { 
                                 if show_model_popup { popup_query.pop(); popup_cursor = 0; }
-                                else if !is_nav_mode { input.pop(); }
+                                else if !is_nav_mode { 
+                                    input.pop(); 
+                                    suggestion_ghost.clear();
+                                    let _ = suggest_tx.try_send(input.clone());
+                                }
+                            },
+                            KeyCode::Tab => {
+                                if !is_nav_mode && !suggestion_ghost.is_empty() {
+                                    input.push_str(&suggestion_ghost);
+                                    suggestion_ghost.clear();
+                                    let _ = suggest_tx.try_send(input.clone());
+                                }
                             },
                             KeyCode::Enter => {
                                 if is_nav_mode {
@@ -364,13 +456,39 @@ pub async fn run_tui(
                                         break;
                                     } else if clean_input == "/model" || clean_input == "/models" {
                                         show_model_popup = true; popup_query.clear(); popup_cursor = 0;
+                                    } else if clean_input == "/report" {
+                                        is_generating_report = true;
+                                        suggestion_ghost.clear();
+                                        
+                                        let llm = llm_engine.clone();
+                                        let graph_ref = graph.clone();
+                                        let rep_tx = report_tx.clone();
+                                        let target = target_shared.try_read().map(|t| t.clone()).unwrap_or("Unknown".into());
+                                        
+                                        tokio::spawn(async move {
+                                            let insights = graph_ref.read().await.get_strategic_insights().join("\n");
+                                            let prompt = format!(
+                                                "You are an expert offensive security reporting engine. \
+                                                 Generate a comprehensive Markdown penetration test report for the target: {}.\n\n\
+                                                 INTELLIGENCE TOPOLOGY GRAPH:\n{}\n\n\
+                                                 Make sure to include an Executive Summary, Discovered Scope/Attack Surface, High-Level Vulnerabilities (if any), and Recommendations.", 
+                                                target, insights
+                                            );
+                                            let msgs = vec![json!({"role": "system", "content": prompt})];
+                                            if let Ok(res) = llm.generate_with_history(msgs).await {
+                                                let _ = rep_tx.send(res).await;
+                                            } else {
+                                                let _ = rep_tx.send("Failed to generate report.".into()).await;
+                                            }
+                                        });
                                     } else {
                                         let _ = cmd_tx.try_send(input.clone());
                                     }
                                     input.clear();
+                                    suggestion_ghost.clear();
                                 }
                             }
-                            KeyCode::Char('q') if input.trim().is_empty() && !show_model_popup => break,
+                            KeyCode::Char('q') if input.trim().is_empty() && !show_model_popup && !active_report.is_some() => break,
                             _ => {}
                         }
                     }

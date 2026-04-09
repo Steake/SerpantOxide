@@ -157,4 +157,45 @@ impl NativeLLMEngine {
 
         Ok(output)
     }
+
+    pub async fn ai_suggest_completion(&self, partial_input: &str, context: &str) -> Result<String, String> {
+        if partial_input.trim().is_empty() { return Ok("".to_string()); }
+        
+        let model = { self.state.read().await.model.clone() };
+
+        let payload = json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": format!("You are an auto-complete AI for a pentest framework terminal. The user's input so far is: '{}'\nContext: {}\n\nProvide ONLY the immediate completion text without repeating their start string. No quotes, no markdown, max 3 words.", partial_input, context)
+                }
+            ],
+            "max_tokens": 15,
+            "temperature": 0.2
+        });
+
+        if self.api_key == "MOCK_KEY" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            if partial_input == "/sc" { return Ok("an".to_string()); }
+            return Ok("".to_string());
+        }
+
+        let response = self.client.post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("HTTP-Referer", "https://github.com/Steake/pentestagent")
+            .header("X-Title", "Serpantoxide AutoComplete")
+            .json(&payload)
+            .send()
+            .await.map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Ok("".to_string()); // Silent fail for completion
+        }
+
+        let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+        let output = body["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+        
+        Ok(output)
+    }
 }

@@ -26,6 +26,7 @@ pub struct WorkerPool {
     pub state: Arc<RwLock<WorkerPoolState>>,
     graph: Arc<RwLock<ShadowGraph>>,
     search: Arc<NativeWebSearch>,
+    browser: Option<Arc<crate::browser::NativeBrowserEngine>>,
     pub event_tx: mpsc::Sender<String>,
 }
 
@@ -33,7 +34,12 @@ use crate::nmap::NativeNmap;
 use crate::sqlmap::NativeSqlmap;
 
 impl WorkerPool {
-    pub fn new(event_tx: mpsc::Sender<String>, graph: Arc<RwLock<ShadowGraph>>, search: Arc<NativeWebSearch>) -> Self {
+    pub fn new(
+        event_tx: mpsc::Sender<String>, 
+        graph: Arc<RwLock<ShadowGraph>>, 
+        search: Arc<NativeWebSearch>,
+        browser: Option<Arc<crate::browser::NativeBrowserEngine>>
+    ) -> Self {
         WorkerPool {
             state: Arc::new(RwLock::new(WorkerPoolState {
                 workers: HashMap::new(),
@@ -42,6 +48,7 @@ impl WorkerPool {
             })),
             graph,
             search,
+            browser,
             event_tx,
         }
     }
@@ -67,6 +74,7 @@ impl WorkerPool {
         let wid = worker_id.clone();
         let graph = self.graph.clone();
         let search = self.search.clone();
+        let browser = self.browser.clone();
         let payload_inner = payload.clone();
 
         let handle = tokio::spawn(async move {
@@ -167,11 +175,24 @@ impl WorkerPool {
                     let mut s = state_clone.write().await;
                     if let Some(w) = s.workers.get_mut(&wid) { w.status = "Browsing".to_string(); }
                 }
-                log(format!("Navigating to {}", url));
-                // Browser integration would need access to BrowserEngine, for now we log the intent
-                log("Universal Browser delegation engaged. Rendering target DOM...".to_string());
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Simulation for now as Pool doesn't own BrowserEngine yet
-                log("DOM state analysis complete. Intelligence extracted.".to_string());
+                
+                if let Some(engine) = browser {
+                    log(format!("Navigating to {} via Chromiumoxide CDP...", url));
+                    match engine.action("navigate", url).await {
+                        Ok(res) => {
+                            log(res);
+                            // Follow up with content extraction
+                            if let Ok(content) = engine.action("get_content", "").await {
+                                log(format!("Content Strategy: Extraction complete ({} bytes).", content.len()));
+                                let mut g = graph.write().await;
+                                g.extract_from_note("browser", &content);
+                            }
+                        },
+                        Err(e) => log(format!("Browser error: {}", e)),
+                    }
+                } else {
+                    log("Error: Native Browser Engine not available in this instance.".to_string());
+                }
             }
 
             {

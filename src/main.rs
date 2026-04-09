@@ -10,6 +10,7 @@ mod graph;
 mod nmap;
 mod sqlmap;
 mod config;
+mod python_vm;
 
 use tokio::sync::mpsc;
 use crate::pool::WorkerPool;
@@ -40,16 +41,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let notes_engine = Arc::new(NotesEngine::launch().await?);
     let llm_engine = Arc::new(NativeLLMEngine::launch().await?);
     
-    let search_key = std::env::var("TAVILY_API_KEY").unwrap_or_else(|_| "MOCK_SEARCH_KEY".to_string());
-    let search_engine = Arc::new(NativeWebSearch::new(&search_key));
-    let worker_pool = WorkerPool::new(event_tx.clone(), graph.clone(), search_engine.clone());
-    let worker_pool_tui = worker_pool.clone();
-
-    let llm_tui = llm_engine.clone();
-    let tui_handler = tokio::spawn(async move {
-        let _ = crate::tui::run_tui(event_rx, cmd_tx, graph_tui, llm_tui, target_tui, worker_pool_tui).await;
-    });
-    
     let mut browser_engine = None;
     let _ = tx.send("Booting Chromiumoxide Native Engine over CDP...".to_string()).await;
     match NativeBrowserEngine::launch().await {
@@ -63,6 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let search_key = std::env::var("TAVILY_API_KEY").unwrap_or_else(|_| "MOCK_SEARCH_KEY".to_string());
+    let search_engine = Arc::new(NativeWebSearch::new(&search_key));
+    let worker_pool = WorkerPool::new(event_tx.clone(), graph.clone(), search_engine.clone(), browser_engine.clone());
+    let worker_pool_tui = worker_pool.clone();
+
+    let llm_tui = llm_engine.clone();
+    let tui_handler = tokio::spawn(async move {
+        let _ = crate::tui::run_tui(event_rx, cmd_tx, graph_tui, llm_tui, target_tui, worker_pool_tui).await;
+    });
+    
     // Initialize Ported Orchestrator with shared graph
     let orchestrator = Orchestrator::new(
         llm_engine.clone(),
@@ -132,6 +133,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = tx.send(format!("Category [{}]: {} discoveries matched.", name, count)).await;
                 }
                 let _ = tx.send("--- End of Report ---".to_string()).await;
+            }
+            "/crew" => {
+                let target = {
+                    let t = target_shared.read().await;
+                    t.clone()
+                };
+                let task = if parts.len() > 1 { parts[1..].join(" ") } else { "Full autonomous assessment".to_string() };
+                let orch = orchestrator.clone();
+                tokio::spawn(async move {
+                    let _ = orch.run_swarm_mode(&target, &task).await;
+                });
             }
             "/clear" => {
                 // TUI currently doesn't have a flush event, but we can send placeholders

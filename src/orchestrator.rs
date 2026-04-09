@@ -8,6 +8,7 @@ use crate::browser::NativeBrowserEngine;
 use crate::terminal::NativeTerminal;
 use crate::web_search::NativeWebSearch;
 use crate::graph::{ShadowGraph};
+use crate::python_vm::{PythonExecutor};
 use serde_json::json;
 
 use crate::nmap::NativeNmap;
@@ -24,6 +25,7 @@ pub struct Orchestrator {
     graph: Arc<RwLock<ShadowGraph>>,
     target_shared: Arc<RwLock<String>>,
     tx: Sender<String>,
+    python: Arc<PythonExecutor>,
 }
 
 impl Orchestrator {
@@ -37,6 +39,8 @@ impl Orchestrator {
         target_shared: Arc<RwLock<String>>,
         tx: Sender<String>,
     ) -> Self {
+        let python = Arc::new(PythonExecutor::new());
+
         Self { 
             llm, 
             pool, 
@@ -45,7 +49,8 @@ impl Orchestrator {
             search,
             graph,
             target_shared,
-            tx 
+            tx,
+            python
         }
     }
 
@@ -67,6 +72,7 @@ impl Orchestrator {
         let max_iterations = 10;
         let mut current_plan = String::new();
         let mut consecutive_searches = 0;
+        let mut previous_commands_history: Vec<String> = Vec::new();
 
         let _ = self.tx.send(format!("🚀 Launching Autonomous Orchestrator: {}", mission_name)).await;
 
@@ -74,7 +80,17 @@ impl Orchestrator {
             iteration += 1;
             let _ = self.tx.send(format!("--- Cycle {}/{} ---", iteration, max_iterations)).await;
 
-            // Step 1: Strategic Intelligence Analysis
+            // Context Culling (Anti-Drift)
+            if history.len() > 15 {
+                let skip_count = history.len() - 10;
+                let mut culled = vec![history[0].clone()]; // Keep initial context
+                let tail: Vec<_> = history.into_iter().skip(skip_count).collect();
+                culled.extend(tail);
+                history = culled;
+                let _ = self.tx.send("🧹 Context window culled to maintain focus.".to_string()).await;
+            }
+
+            // Step 1: Strategic Intelligence Analysis (Memory Injection)
             let insights = self.graph.read().await.get_strategic_insights();
             let system_prompt = self.build_system_prompt(target, &insights, &current_plan).await;
             
@@ -84,25 +100,42 @@ impl Orchestrator {
 
             let response = self.llm.generate_with_history(messages).await?;
             
-            // Tactical Reasoning Truncation
-            let tactical_reasoning = response.lines()
-                .find(|l| l.to_lowercase().contains("reasoning:"))
-                .unwrap_or(response.lines().next().unwrap_or(""));
-            let summary = if tactical_reasoning.len() > 120 { format!("{}...", &tactical_reasoning[..120]) } else { tactical_reasoning.to_string() };
+            // Tactical Reasoning Truncation (Extract ANALYSIS)
+            let analysis_block = response.lines()
+                .skip_while(|l| !l.starts_with("ANALYSIS:"))
+                .take_while(|l| !l.starts_with("PLAN:"))
+                .map(|l| l.strip_prefix("ANALYSIS:").unwrap_or(l).trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let summary = if analysis_block.is_empty() { 
+                "Proceeding with next step.".to_string() 
+            } else if analysis_block.len() > 120 { 
+                format!("{}...", &analysis_block[..120]) 
+            } else { 
+                analysis_block.clone() 
+            };
             let _ = self.tx.send(format!("🧠 {}", summary)).await;
 
             // Step 3: Tool Execution & Plan Extraction
-            if response.contains("PLAN:") && current_plan.is_empty() {
-                current_plan = response.clone();
-                let _ = self.tx.send("📝 Mission Strategy established.".to_string()).await;
+            let plan_lines: Vec<&str> = response.lines()
+                .skip_while(|l| !l.starts_with("PLAN:"))
+                .take_while(|l| !l.starts_with("ACTION:"))
+                .collect();
+            
+            if !plan_lines.is_empty() {
+                current_plan = plan_lines.join("\n");
+                let _ = self.tx.send("📝 Mission Strategy Updated.".to_string()).await;
             }
 
             let mut tool_used = false;
-            for line in response.lines() {
+            for line in response.lines().skip_while(|l| !l.starts_with("ACTION:")) {
                 let trimmed = line.trim();
                 let is_background = trimmed.starts_with("BACKGROUND:");
                 let cmd_part = if is_background {
                     trimmed.strip_prefix("BACKGROUND:").unwrap_or(trimmed).trim()
+                } else if trimmed.starts_with("ACTION:") {
+                    trimmed.strip_prefix("ACTION:").unwrap_or(trimmed).trim()
                 } else {
                     trimmed
                 };
@@ -120,7 +153,16 @@ impl Orchestrator {
                     else if cmd_part.contains("TERMINAL:") { "TERMINAL" }
                     else { continue; };
 
+                // Anti-Looping Guardrail
+                let raw_cmd = cmd_part.to_string();
+                if previous_commands_history.contains(&raw_cmd) {
+                     let _ = self.tx.send("⚠️ Detected repetition. Intervening...".to_string()).await;
+                     history.push(json!({"role": "system", "content": "⚠️ You are repeating the exact same command. Abort this approach and try alternative tactics."}));
+                     continue;
+                }
+                previous_commands_history.push(raw_cmd.clone());
                 tool_used = true;
+
                 consecutive_searches = if tool_type == "SEARCH" { consecutive_searches + 1 } else { 0 };
 
                 if tool_type == "SEARCH" && consecutive_searches >= 3 {
@@ -198,31 +240,96 @@ impl Orchestrator {
         let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
 
         format!(
-            "You are the Serpantoxide Elite Orchestrator – an autonomous, high-efficiency offensive security agent. \n\
+            "You are the Serpantoxide Elite Orchestrator – an autonomous offensive security agent. \n\
+             [PHASE: RECON & EXPLOIT]\n\
              LOCAL CONTEXT (Grounding):\n\
              - OS: {}\n\
              - Arch: {}\n\
              - User: {}\n\
              - Time: {}\n\n\
-             Target: {}.\n\n\
-             ROLE DIRECTIVES:\n\
-             1. DIRECT ACTION: You are an expert. Never search for generic attack 'techniques' or academic definitions. \
-                Use SEARCH only for target-specific intelligence (e.g., 'CVE for [version]') or discovering specific exploits for found services.\n\
-             2. TOOL FIRST: Prioritize NMAP, SQLMAP, and BROWSER on the target. Your goal is compromise and discovery, not research.\n\
-             3. PARALLELISM: Use BACKGROUND: to run reconnaissance (NMAP/SEARCH) in parallel with active analysis.\n\
-             4. CONCISION: Your reasoning should be tactical and brief. Execute immediately.\n\n\
-             STRATEGIC INTELLIGENCE (Loot & Topology):\n{}\n\n\
-             ACTIVE MISSION PLAN:\n{}\n\n\
-             TOOLSET COMMANDS:\n\
+             [OBJECTIVE]: Compromise {}\n\n\
+             [CONSTRAINTS & RULES]:\n\
+             1. NO DRIFTING: Use tools directly against the target. Never search for generic tutorials.\n\
+             2. REFLECTION REQUIRED: You MUST always format your output with three explicit blocks before executing logic. \n\
+             3. NEVER REPEAT: If a command fails, do not execute the exact same command. Alter your tactics.\n\n\
+             [INTELLIGENCE MEMORY]:\n{}\n\n\
+             [CURRENT PLAN TRACKER]:\n{}\n\n\
+             [TOOLSET COMMANDS]:\n\
              - SEARCH: <query> (Target-specific discovery only)\n\
              - NMAP: <host> (Fast protocol discovery)\n\
              - SQLMAP: <url> (Automated injection testing)\n\
              - BROWSER: <url> (Native web interaction & rendering)\n\
              - TERMINAL: <cmd> (Custom local tool execution)\n\
              - FINISH (Objective achieved)\n\n\
-             FORMAT: Always include a tactical REASONING line followed by one or more COMMANDs. \
-             Example: Reasoning: Found port 80 open. BACKGROUND: NMAP: 192.168.1.1\nBROWSER: http://192.168.1.1",
+             FORMAT RESTRICTION: Your response MUST STRICTLY follow this format:\n\
+             ANALYSIS: [1-2 sentences on what the last tool output means or changes]\n\
+             PLAN: \n[ ] 1. Next step\n[ ] 2. Following step\n\
+             ACTION: [A command from the toolset above. Or BACKGROUND: <cmd> to not wait for it]\n",
             os, arch, user, now, target, insights.join("\n"), plan
         )
+    }
+
+    pub async fn generate_report(&self, target: &str) -> Result<String, String> {
+        let _ = self.tx.send("📑 Compiling Intelligence for Executive Report...".to_string()).await;
+        
+        let insights = self.graph.read().await.get_strategic_insights().join("\n");
+        // Simplified note retrieval placeholder for report
+        let notes_data = "Loot gathered during operations...".to_string(); 
+
+        let prompt = format!(
+            "You are an expert offensive security reporting engine. \
+             Generate a comprehensive Markdown penetration test report for the target: {}.\n\n\
+             INTELLIGENCE TOPOLOGY GRAPH:\n{}\n\n\
+             DISCOVERED LOOT:\n{}\n\n\
+             The report should include an Executive Summary, Discovered Scope/Attack Surface, High-Level Vulnerabilities (if any), and Recommendations. Ensure proper Markdown headers (#, ##) and bullet points.", 
+            target, insights, notes_data
+        );
+
+        let messages = vec![json!({"role": "system", "content": prompt})];
+        self.llm.generate_with_history(messages).await
+    }
+    pub async fn run_swarm_mode(&self, target: &str, task: &str) -> Result<(), String> {
+        let _ = self.tx.send("🚀 [Crew Mode] Initializing Strategic Python Orchestrator...".to_string()).await;
+        
+        // Load the crew script (we'll embed a simple loader or read from file)
+        let script = match std::fs::read_to_string("python_assets/crew_swarm.py") {
+            Ok(s) => s,
+            Err(e) => return Err(format!("Failed to load swarm script: {}", e)),
+        };
+
+        let python = self.python.clone();
+        let target_str = target.to_string();
+        let task_str = task.to_string();
+
+        match tokio::task::spawn_blocking(move || {
+            python.call_function(&script, "run_swarm", &target_str, &task_str)
+        }).await {
+            Ok(inner_res) => match inner_res {
+                Ok(json_res) => {
+                    let _ = self.tx.send(format!("🧠 Swarm Strategy Logic Resolved: {}", json_res)).await;
+                    
+                    // Parse the task list
+                    if let Ok(tasks) = serde_json::from_str::<Vec<String>>(&json_res) {
+                        for task in tasks {
+                            let wid = self.pool.spawn(task.clone()).await;
+                            let _ = self.tx.send(format!("🚀 [Swarm Dispatch] Task '{}' assigned to Worker {}", task, wid)).await;
+                        }
+                        Ok(())
+                    } else {
+                        let _ = self.tx.send("❌ Failed to parse strategy mission plan.".to_string()).await;
+                        Err("Invalid strategy output".to_string())
+                    }
+                },
+                Err(e) => {
+                    let _ = self.tx.send(format!("❌ Strategic Layer Error: {}", e)).await;
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let err_msg = format!("Task Spawn Error: {}", e);
+                let _ = self.tx.send(format!("❌ {}", err_msg)).await;
+                Err(err_msg)
+            }
+        }
     }
 }
