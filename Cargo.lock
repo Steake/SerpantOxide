@@ -15,6 +15,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest 0.12.28",
+ "rustpython-pylib",
  "rustpython-vm",
  "serde",
  "serde_json",
@@ -2123,6 +2124,17 @@ checksum = "04fcea49a4630a3a5d940f4d514dc4f575ed63c14c3e3ed07146634aed7f67a6"
 dependencies = [
  "memchr",
  "once_cell",
+]
+
+[[package]]
+name = "rustpython-pylib"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "852d8eb34fce6cbce4eab3b42a87ef996197230168c7fca9d98173057ce27050"
+dependencies = [
+ "glob",
+ "rustpython-compiler-core",
+ "rustpython-derive",
 ]
 
 [[package]]

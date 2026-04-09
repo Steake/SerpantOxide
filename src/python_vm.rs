@@ -1,4 +1,5 @@
 use rustpython_vm as vm;
+use rustpython_pylib;
 
 pub struct PythonExecutor;
 
@@ -8,7 +9,9 @@ impl PythonExecutor {
     }
 
     pub fn execute(&self, source: &str) -> Result<String, String> {
-        let interpreter = vm::Interpreter::with_init(Default::default(), |_vm| {});
+        let interpreter = vm::Interpreter::with_init(Default::default(), |vm| {
+            vm.add_frozen(rustpython_pylib::FROZEN_STDLIB);
+        });
 
         interpreter.enter(|vm| {
             let scope = vm.new_scope_with_builtins();
@@ -29,7 +32,9 @@ impl PythonExecutor {
     
     /// Execute a specific function by name and return string result
     pub fn call_function(&self, script: &str, func_name: &str, target: &str, task: &str) -> Result<String, String> {
-        let interpreter = vm::Interpreter::with_init(Default::default(), |_vm| {});
+        let interpreter = vm::Interpreter::with_init(Default::default(), |vm| {
+            vm.add_frozen(rustpython_pylib::FROZEN_STDLIB);
+        });
         
         interpreter.enter(|vm| {
             let scope = vm.new_scope_with_builtins();
