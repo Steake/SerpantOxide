@@ -1,0 +1,24 @@
+[package]
+name = "Serpantoxide"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustpython-vm = { version = "0.4.0", features = ["freeze-stdlib"] }
+tokio = { version = "1.51.1", features = ["full"] }
+chromiumoxide = "0.9.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "charset"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3.31"
+ratatui = "0.26"
+crossterm = { version = "0.27", features = ["event-stream"] }
+petgraph = "0.6"
+regex = "1.10"
+dotenv = "0.15.0"
+chrono = "0.4"
+
+[profile.dev]
+debug = 0
+opt-level = "z"
+strip = true
