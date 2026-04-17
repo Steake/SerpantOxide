@@ -1,23 +1,53 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::Duration;
+
 use tokio::time::timeout;
 
 pub struct NativeTerminal;
 
 impl NativeTerminal {
-    pub async fn execute(command: &str, timeout_secs: u64) -> Result<String, String> {
-        let cmd_parts: Vec<&str> = command.split_whitespace().collect();
-        if cmd_parts.is_empty() {
-            return Err("Empty command provided".to_string());
-        }
+    pub async fn execute_with_options(
+        command: &str,
+        timeout_secs: u64,
+        working_dir: Option<&str>,
+        inputs: Option<&str>,
+        privileged: bool,
+    ) -> Result<String, String> {
+        let shell_command = if privileged {
+            format!("sudo -S sh -lc '{}'", escape_single_quotes(command))
+        } else {
+            format!("sh -lc '{}'", escape_single_quotes(command))
+        };
 
-        let mut child = Command::new(cmd_parts[0]);
-        if cmd_parts.len() > 1 {
-            child.args(&cmd_parts[1..]);
-        }
+        let working_dir = working_dir.map(ToString::to_string);
+        let inputs = inputs.map(ToString::to_string);
 
         let output_future = tokio::task::spawn_blocking(move || {
-            child.output()
+            let mut child = Command::new("sh");
+            child.arg("-lc").arg(shell_command);
+            child.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+            if inputs.is_some() {
+                child.stdin(Stdio::piped());
+            }
+
+            if let Some(dir) = working_dir {
+                child.current_dir(dir);
+            }
+
+            let mut child = child.spawn()?;
+
+            if let Some(input) = inputs {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(input.as_bytes())?;
+                    if !input.ends_with('\n') {
+                        stdin.write_all(b"\n")?;
+                    }
+                }
+            }
+
+            child.wait_with_output()
         });
 
         match timeout(Duration::from_secs(timeout_secs), output_future).await {
@@ -36,4 +66,8 @@ impl NativeTerminal {
             Err(_) => Err(format!("Command timed out after {}s", timeout_secs)),
         }
     }
+}
+
+fn escape_single_quotes(input: &str) -> String {
+    input.replace('\'', "'\"'\"'")
 }

@@ -15,7 +15,9 @@ impl NativeWebSearch {
     }
 
     pub async fn search(&self, query: &str) -> Result<String, String> {
-        let response = self.client.post("https://api.tavily.com/search")
+        let response = self
+            .client
+            .post("https://api.tavily.com/search")
             .json(&json!({
                 "api_key": &self.api_key,
                 "query": query,
@@ -28,7 +30,7 @@ impl NativeWebSearch {
             .map_err(|e| e.to_string())?;
 
         let data: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-        
+
         let mut parts = vec![format!("Search Query: {}\n", query)];
 
         if let Some(answer) = data.get("answer").and_then(|a| a.as_str()) {
@@ -38,7 +40,10 @@ impl NativeWebSearch {
         if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
             parts.push("Sources:".to_string());
             for (i, res) in results.iter().enumerate() {
-                let title = res.get("title").and_then(|t| t.as_str()).unwrap_or("Untitled");
+                let title = res
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("Untitled");
                 let url = res.get("url").and_then(|u| u.as_str()).unwrap_or("");
                 parts.push(format!("  [{}] {}", i + 1, title));
                 parts.push(format!("      {}", url));
@@ -46,5 +51,9 @@ impl NativeWebSearch {
         }
 
         Ok(parts.join("\n"))
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
     }
 }

@@ -1,5 +1,5 @@
-use std::process::Command;
 use regex::Regex;
+use std::process::Command;
 
 pub struct NativeSqlmap;
 
@@ -18,7 +18,9 @@ impl NativeSqlmap {
                     .arg("--risk=1")
                     .output()
             }
-        }).await.map_err(|e| e.to_string());
+        })
+        .await
+        .map_err(|e| e.to_string());
 
         match output {
             Ok(Ok(out)) => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
@@ -42,7 +44,9 @@ impl NativeSqlmap {
                     it is recommended to perform a standard search for CVE-2024-52033\n\
                     \n\
                     [*] shutting down at 16:40:05\n\
-                    Target URL: {}", url))
+                    Target URL: {}",
+                    url
+                ))
             }
         }
     }

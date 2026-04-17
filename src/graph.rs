@@ -1,6 +1,6 @@
 use petgraph::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NodeType {
@@ -46,7 +46,10 @@ impl ShadowGraph {
     }
 
     pub fn add_edge(&mut self, source_id: &str, target_id: &str, edge_type: &str) {
-        if let (Some(&src), Some(&target)) = (self.node_indices.get(source_id), self.node_indices.get(target_id)) {
+        if let (Some(&src), Some(&target)) = (
+            self.node_indices.get(source_id),
+            self.node_indices.get(target_id),
+        ) {
             self.graph.add_edge(src, target, edge_type.to_string());
         }
     }
@@ -54,8 +57,9 @@ impl ShadowGraph {
     pub fn extract_from_note(&mut self, category: &str, content: &str) {
         use regex::Regex;
         let ip_regex = Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap();
-        
-        let ips: Vec<String> = ip_regex.find_iter(content)
+
+        let ips: Vec<String> = ip_regex
+            .find_iter(content)
             .map(|m| m.as_str().to_string())
             .collect();
 
@@ -74,15 +78,20 @@ impl ShadowGraph {
 
     pub fn get_strategic_insights(&self) -> Vec<String> {
         let mut insights = Vec::new();
-        
+
         for idx in self.graph.node_indices() {
             let data = &self.graph[idx];
             if data.node_type == NodeType::Credential {
-                let neighbors: Vec<_> = self.graph.neighbors(idx)
+                let neighbors: Vec<_> = self
+                    .graph
+                    .neighbors(idx)
                     .map(|n| self.graph[n].label.clone())
                     .collect();
                 if !neighbors.is_empty() {
-                    insights.push(format!("Valid credentials found for: {}", neighbors.join(", ")));
+                    insights.push(format!(
+                        "Valid credentials found for: {}",
+                        neighbors.join(", ")
+                    ));
                 }
             } else if data.node_type == NodeType::Vulnerability {
                 insights.push(format!("Confirmed Vulnerability: {}", data.label));
@@ -90,7 +99,9 @@ impl ShadowGraph {
         }
 
         if insights.is_empty() {
-            insights.push("No strategic insights available yet. Continue scanning targets.".to_string());
+            insights.push(
+                "No strategic insights available yet. Continue scanning targets.".to_string(),
+            );
         }
 
         insights
@@ -121,7 +132,9 @@ impl ShadowGraph {
 
     pub fn to_ascii_topology(&self, width: u16) -> String {
         let mut lines = Vec::new();
-        let hosts: Vec<_> = self.graph.node_indices()
+        let hosts: Vec<_> = self
+            .graph
+            .node_indices()
             .filter(|&i| self.graph[i].node_type == NodeType::Host)
             .collect();
 
@@ -135,9 +148,11 @@ impl ShadowGraph {
         for host_idx in hosts {
             let data = &self.graph[host_idx];
             let label = data.label.clone();
-            
+
             // Collect services
-            let services: Vec<_> = self.graph.neighbors(host_idx)
+            let services: Vec<_> = self
+                .graph
+                .neighbors(host_idx)
                 .filter(|&n| self.graph[n].node_type == NodeType::Service)
                 .map(|n| self.graph[n].label.clone())
                 .collect();
@@ -156,7 +171,7 @@ impl ShadowGraph {
                 }
             }
             host_box.push(format!("└{:─^18}┘", ""));
-            
+
             current_row.push(host_box);
 
             if current_row.len() * (box_width + 2) > width as usize {
@@ -178,7 +193,7 @@ impl ShadowGraph {
 
         // Render remaining row
         if !current_row.is_empty() {
-             for i in 0..6 {
+            for i in 0..6 {
                 let mut line = String::new();
                 for box_lines in &current_row {
                     if i < box_lines.len() {

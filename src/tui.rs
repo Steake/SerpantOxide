@@ -1,26 +1,30 @@
 use crossterm::{
-    event::{Event, KeyCode, EventStream, EnableMouseCapture, DisableMouseCapture, MouseEventKind, MouseButton},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseButton,
+        MouseEventKind,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style, Modifier},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, List, ListItem, Clear, Wrap},
-    Terminal,
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use serde_json::json;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
-use serde_json::json;
 
-use tokio::sync::RwLock;
+use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
 use crate::pool::WorkerPool;
 use chrono::Local;
+use tokio::sync::RwLock;
 
 pub async fn run_tui(
     mut event_rx: Receiver<String>,
@@ -39,13 +43,15 @@ pub async fn run_tui(
     let mut logs: Vec<String> = Vec::new();
     let mut reader = EventStream::new();
     let mut input = String::new();
-    
+
     // UI State
     let mut is_nav_mode = false;
     let mut telemetry_scroll: u16 = 0;
     let mut agent_cursor: usize = 0;
     let mut selected_agent_id: Option<String> = None;
     let mut agent_detail_scroll: u16 = 0;
+    let mut completed_checklist: Vec<String> = Vec::new();
+    let mut remaining_checklist: Vec<String> = Vec::new();
 
     // Existing Popup state
     let mut show_model_popup = false;
@@ -56,7 +62,7 @@ pub async fn run_tui(
     let mut suggestion_ghost = String::new();
     let (suggest_tx, mut suggest_rx) = tokio::sync::mpsc::channel::<String>(100);
     let (suggest_resp_tx, mut suggest_resp_rx) = tokio::sync::mpsc::channel::<String>(100);
-    
+
     let engine_clone = llm_engine.clone();
     tokio::spawn(async move {
         let mut last_req = String::new();
@@ -65,12 +71,18 @@ pub async fn run_tui(
                 Some(r) => r,
                 None => break,
             };
-            while let Ok(r) = suggest_rx.try_recv() { req = r; }
-            if req == last_req { continue; }
+            while let Ok(r) = suggest_rx.try_recv() {
+                req = r;
+            }
+            if req == last_req {
+                continue;
+            }
             last_req = req.clone();
-            
+
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            if !suggest_rx.is_empty() { continue; }
+            if !suggest_rx.is_empty() {
+                continue;
+            }
 
             if !req.is_empty() {
                 let context = "User typing a pentest orchestrator prompt.";
@@ -90,28 +102,48 @@ pub async fn run_tui(
     let (report_tx, mut report_rx) = tokio::sync::mpsc::channel::<String>(2);
 
     let _commands = vec![
-        "/agent", "/crew", "/se", "/evm", "/chain", "/target", "/tools",
-        "/notes", "/nodes", "/report", "/memory", "/topology", "/prompt", "/config",
-        "/clear", "/help", "/quit", "/model", "/models", "/modes"
+        "/agent",
+        "/crew",
+        "/se",
+        "/evm",
+        "/chain",
+        "/target",
+        "/tools",
+        "/notes",
+        "/nodes",
+        "/report",
+        "/memory",
+        "/topology",
+        "/prompt",
+        "/config",
+        "/clear",
+        "/help",
+        "/quit",
+        "/model",
+        "/models",
+        "/modes",
     ];
 
     loop {
         let g = graph.clone();
         let pool = worker_pool.state.clone();
-        
+
         terminal.draw(|f| {
             let size = f.size();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),  // Header
-                    Constraint::Length(8),  // Condensed Topology (Top)
-                    Constraint::Min(5),      // Main Body (Logs + Agents)
-                    Constraint::Length(3),  // Prompt
-                ].as_ref())
+                .constraints(
+                    [
+                        Constraint::Length(3), // Header
+                        Constraint::Length(8), // Condensed Topology (Top)
+                        Constraint::Min(5),    // Main Body (Logs + Agents)
+                        Constraint::Length(3), // Prompt
+                    ]
+                    .as_ref(),
+                )
                 .split(size);
 
-             // Integrated Header
+            // Integrated Header
             let (model_name, is_thinking) = {
                 let s = llm_engine.state.try_read();
                 if let Ok(s) = s {
@@ -120,8 +152,11 @@ pub async fn run_tui(
                     ("Loading...".to_string(), false)
                 }
             };
-            let target = target_shared.try_read().map(|t| t.clone()).unwrap_or("None".to_string());
-            
+            let target = target_shared
+                .try_read()
+                .map(|t| t.clone())
+                .unwrap_or("None".to_string());
+
             let header_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -132,25 +167,39 @@ pub async fn run_tui(
                 .split(chunks[0]);
 
             let mission_block = Paragraph::new(format!(" OBJECTIVE: {}", target))
-                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                .block(Block::default().borders(Borders::ALL).title(" Mission Control "))
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Mission Control "),
+                )
                 .wrap(Wrap { trim: true });
-            
+
             let model_block = Paragraph::new(format!(" Model: {}", model_name))
                 .style(Style::default().fg(Color::Magenta))
                 .block(Block::default().borders(Borders::ALL).title(" Provider "))
                 .wrap(Wrap { trim: true });
 
-            let (state_text, state_style) = if is_thinking { 
-                ("Thinking...".to_string(), Style::default().fg(Color::Yellow)) 
-            } else { 
-                ("Idle".to_string(), Style::default().fg(Color::Green)) 
+            let (state_text, state_style) = if is_thinking {
+                (
+                    "Thinking...".to_string(),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else {
+                ("Idle".to_string(), Style::default().fg(Color::Green))
             };
 
             let llm_metrics = {
                 let s = llm_engine.state.try_read();
                 if let Ok(s) = s {
-                    format!(" Latency: {}ms\n Tokens: P:{} | C:{}", s.last_latency_ms, s.prompt_tokens, s.completion_tokens)
+                    format!(
+                        " Latency: {}ms\n Tokens: P:{} | C:{}",
+                        s.last_latency_ms, s.prompt_tokens, s.completion_tokens
+                    )
                 } else {
                     " Loading metrics...".to_string()
                 }
@@ -158,7 +207,11 @@ pub async fn run_tui(
 
             let state_block = Paragraph::new(format!(" Status: {}\n{}", state_text, llm_metrics))
                 .style(state_style)
-                .block(Block::default().borders(Borders::ALL).title(" LLM Telemetry "));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" LLM Telemetry "),
+                );
 
             f.render_widget(mission_block, header_chunks[0]);
             f.render_widget(model_block, header_chunks[1]);
@@ -173,35 +226,80 @@ pub async fn run_tui(
 
             let topology = Paragraph::new(topology_text)
                 .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL).title(" Network Topology Map "));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Network Topology Map "),
+                );
             f.render_widget(topology, chunks[1]);
 
-            // Main Body: Logs (Left) + Agents (Right)
+            // Main Body: Logs (Left) + Crew Panel (Right)
             let body_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(75),
-                    Constraint::Percentage(25),
-                ])
+                .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
                 .split(chunks[2]);
 
-            let telemetry_title = if is_nav_mode { " [NAV MODE] Execution Telemetry (Arrows to Scroll) " } else { " Execution Telemetry (Esc for Nav) " };
+            let telemetry_title = if is_nav_mode {
+                " [NAV MODE] Execution Telemetry (Arrows to Scroll) "
+            } else {
+                " Execution Telemetry (Esc for Nav) "
+            };
             let log_para = Paragraph::new(logs.join("\n"))
-                .block(Block::default().borders(Borders::ALL).title(telemetry_title))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(telemetry_title),
+                )
                 .style(Style::default().fg(Color::White))
                 .wrap(Wrap { trim: true })
                 .scroll((telemetry_scroll, 0));
             f.render_widget(log_para, body_chunks[0]);
 
+            let crew_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(10), Constraint::Min(8)])
+                .split(body_chunks[1]);
+
+            let mut checklist_lines = Vec::new();
+            if completed_checklist.is_empty() && remaining_checklist.is_empty() {
+                checklist_lines.push("No published plan yet.".to_string());
+            } else {
+                if !remaining_checklist.is_empty() {
+                    checklist_lines.push("In Progress:".to_string());
+                    for item in &remaining_checklist {
+                        checklist_lines.push(format!("[ ] {}", item));
+                    }
+                }
+                if !completed_checklist.is_empty() {
+                    if !checklist_lines.is_empty() {
+                        checklist_lines.push(String::new());
+                    }
+                    checklist_lines.push("Completed:".to_string());
+                    for item in &completed_checklist {
+                        checklist_lines.push(format!("[x] {}", item));
+                    }
+                }
+            }
+
+            let checklist = Paragraph::new(checklist_lines.join("\n"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Mission Checklist "),
+                )
+                .wrap(Wrap { trim: true });
+            f.render_widget(checklist, crew_chunks[0]);
+
             // Agent Panel
             let mut agent_list_items = Vec::new();
-            let mut sorted_workers = Vec::new();
             if let Ok(p) = pool.try_read() {
                 let mut workers: Vec<_> = p.workers.values().collect();
                 workers.sort_by(|a, b| a.id.cmp(&b.id));
                 for (i, w) in workers.iter().enumerate() {
                     let style = if i == agent_cursor && is_nav_mode {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
@@ -213,7 +311,7 @@ pub async fn run_tui(
                         "Error" => "⚠️",
                         _ => "💤",
                     };
-                    
+
                     let status_color = match w.status.as_str() {
                         "Scanning" | "Injecting" => Color::Yellow,
                         "Finished" => Color::Green,
@@ -221,32 +319,57 @@ pub async fn run_tui(
                         _ => Color::Gray,
                     };
 
-                    let pulse = if w.status == "Scanning" || w.status == "Injecting" || w.status == "Searching" || w.status == "Executing" || w.status == "Browsing" {
+                    let pulse = if w.status == "Scanning"
+                        || w.status == "Injecting"
+                        || w.status == "Searching"
+                        || w.status == "Executing"
+                        || w.status == "Browsing"
+                    {
                         let tick = Local::now().timestamp_subsec_millis() / 500;
                         if tick % 2 == 0 { "*" } else { " " }
-                    } else { "" };
+                    } else {
+                        ""
+                    };
 
-                    agent_list_items.push(ListItem::new(format!(" {} {} {} {}", emoji, w.id, w.status, pulse)).style(style.fg(status_color)));
-                    sorted_workers.push(w.id.clone());
+                    agent_list_items.push(
+                        ListItem::new(format!(" {} {} {} {}", emoji, w.id, w.status, pulse))
+                            .style(style.fg(status_color)),
+                    );
                 }
             }
 
-            let agent_list = List::new(agent_list_items)
-                .block(Block::default().borders(Borders::ALL).title(" Active Agents "));
-            f.render_widget(agent_list, body_chunks[1]);
+            let agent_list = List::new(agent_list_items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Active Agents "),
+            );
+            f.render_widget(agent_list, crew_chunks[1]);
 
             // Interaction Bar (Footer)
-            let prompt_border_style = if is_nav_mode { Style::default().fg(Color::DarkGray) } else { Style::default().fg(Color::Yellow) };
-            
-            let mut prompt_spans = vec![
-                Span::styled(format!("> {}", input), Style::default().fg(Color::Yellow)),
-            ];
+            let prompt_border_style = if is_nav_mode {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+
+            let mut prompt_spans = vec![Span::styled(
+                format!("> {}", input),
+                Style::default().fg(Color::Yellow),
+            )];
             if !suggestion_ghost.is_empty() && !is_nav_mode {
-                prompt_spans.push(Span::styled(suggestion_ghost.clone(), Style::default().fg(Color::DarkGray)));
+                prompt_spans.push(Span::styled(
+                    suggestion_ghost.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
 
             let input_para = Paragraph::new(Line::from(prompt_spans))
-                .block(Block::default().borders(Borders::ALL).title(" Agent Prompt (Tab to complete, /commands) ").border_style(prompt_border_style))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Agent Prompt (Tab to complete, /commands) ")
+                        .border_style(prompt_border_style),
+                )
                 .wrap(Wrap { trim: true });
             f.render_widget(input_para, chunks[3]);
 
@@ -266,14 +389,19 @@ pub async fn run_tui(
                         if w.loot.is_empty() {
                             detail_lines.push("  (No unique loot discovered yet)".to_string());
                         } else {
-                            for l in &w.loot { detail_lines.push(format!("  [+] {}", l)); }
+                            for l in &w.loot {
+                                detail_lines.push(format!("  [+] {}", l));
+                            }
                         }
                         detail_lines.push("-----------------------------------".to_string());
                         detail_lines.push("TERMINAL STREAMING OUTPUT:".to_string());
                         detail_lines.extend(w.logs.iter().cloned());
 
                         let detail_para = Paragraph::new(detail_lines.join("\n"))
-                            .block(Block::default().borders(Borders::ALL).title(format!(" Intelligence Report: {} (Arrows to Scroll, ESC to close) ", w.id)))
+                            .block(Block::default().borders(Borders::ALL).title(format!(
+                                " Intelligence Report: {} (Arrows to Scroll, ESC to close) ",
+                                w.id
+                            )))
                             .wrap(Wrap { trim: true })
                             .scroll((agent_detail_scroll, 0));
                         f.render_widget(detail_para, area);
@@ -289,23 +417,42 @@ pub async fn run_tui(
                     let free_only = filter.contains(":free");
                     let clean_query = filter.replace(":free", "").trim().to_string();
 
-                    let filtered_models: Vec<_> = s.available_models.iter()
+                    let filtered_models: Vec<_> = s
+                        .available_models
+                        .iter()
                         .filter(|m| {
-                            let matches_query = m.id.to_lowercase().contains(&clean_query) || m.name.to_lowercase().contains(&clean_query);
-                            let is_free = if let Some(p) = &m.pricing { 
-                                p.prompt.parse::<f64>().unwrap_or(1.0) == 0.0 && p.completion.parse::<f64>().unwrap_or(1.0) == 0.0
-                            } else { false };
+                            let matches_query = m.id.to_lowercase().contains(&clean_query)
+                                || m.name.to_lowercase().contains(&clean_query);
+                            let is_free = if let Some(p) = &m.pricing {
+                                p.prompt.parse::<f64>().unwrap_or(1.0) == 0.0
+                                    && p.completion.parse::<f64>().unwrap_or(1.0) == 0.0
+                            } else {
+                                false
+                            };
                             matches_query && (!free_only || is_free)
                         })
                         .collect();
 
-                    let items: Vec<ListItem> = filtered_models.iter().enumerate().map(|(i, m)| {
-                        let style = if i == popup_cursor { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
-                        ListItem::new(format!("{} ({})", m.name, m.id)).style(style)
-                    }).collect();
+                    let items: Vec<ListItem> = filtered_models
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| {
+                            let style = if i == popup_cursor {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            ListItem::new(format!("{} ({})", m.name, m.id)).style(style)
+                        })
+                        .collect();
 
                     let list = List::new(items)
-                        .block(Block::default().borders(Borders::ALL).title(format!(" Select Model (Filter: '{}', ESC to cancel) ", popup_query)))
+                        .block(Block::default().borders(Borders::ALL).title(format!(
+                            " Select Model (Filter: '{}', ESC to cancel) ",
+                            popup_query
+                        )))
                         .highlight_symbol(">> ");
                     f.render_widget(list, area);
                 }
@@ -314,25 +461,50 @@ pub async fn run_tui(
             if is_generating_report {
                 let area = centered_rect(50, 20, size);
                 f.render_widget(Clear, area);
-                let loading = Paragraph::new("Synthesizing Intelligence...\nCalling Executive Summary Agent...")
-                    .style(Style::default().fg(Color::Yellow))
-                    .block(Block::default().borders(Borders::ALL).title(" Generating Report "));
+                let loading = Paragraph::new(
+                    "Synthesizing Intelligence...\nCalling Executive Summary Agent...",
+                )
+                .style(Style::default().fg(Color::Yellow))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Generating Report "),
+                );
                 f.render_widget(loading, area);
             } else if let Some(report) = &active_report {
                 let area = centered_rect(90, 90, size);
                 f.render_widget(Clear, area);
-                let report_para = Paragraph::new(report.as_str())
-                    .style(Style::default().fg(Color::White))
-                    .block(Block::default().borders(Borders::ALL).title(" Executive Intelligence Report (Arrows to scroll, ESC to close) "))
-                    .wrap(Wrap { trim: true })
-                    .scroll((report_scroll, 0));
+                let report_para =
+                    Paragraph::new(report.as_str())
+                        .style(Style::default().fg(Color::White))
+                        .block(Block::default().borders(Borders::ALL).title(
+                            " Executive Intelligence Report (Arrows to scroll, ESC to close) ",
+                        ))
+                        .wrap(Wrap { trim: true })
+                        .scroll((report_scroll, 0));
                 f.render_widget(report_para, area);
             }
         })?;
 
         tokio::select! {
             Some(msg) = event_rx.recv() => {
-                logs.push(msg);
+                if let Ok(event) = serde_json::from_str::<UiEvent>(&msg) {
+                    match event {
+                        UiEvent::Log { message } => logs.push(message),
+                        UiEvent::Checklist { completed, remaining } => {
+                            completed_checklist = completed;
+                            remaining_checklist = remaining;
+                            logs.push("Checklist updated.".to_string());
+                        }
+                        UiEvent::CrewComplete { summary } => {
+                            logs.push("Crew complete.".to_string());
+                            active_report = Some(summary);
+                            report_scroll = 0;
+                        }
+                    }
+                } else {
+                    logs.push(msg);
+                }
                 if logs.len() > 2000 { logs.remove(0); }
                 if !is_nav_mode {
                     telemetry_scroll = logs.len().saturating_sub(10) as u16; // Auto-scroll
@@ -393,18 +565,19 @@ pub async fn run_tui(
                                     }
                                 }
                             }
+                            KeyCode::Char('q') if input.trim().is_empty() && !show_model_popup && active_report.is_none() && selected_agent_id.is_none() => break,
                             KeyCode::Char(c) => {
                                 if show_model_popup { popup_query.push(c); popup_cursor = 0; }
-                                else if !is_nav_mode { 
-                                    input.push(c); 
+                                else if !is_nav_mode {
+                                    input.push(c);
                                     suggestion_ghost.clear();
                                     let _ = suggest_tx.try_send(input.clone());
                                 }
                             },
-                            KeyCode::Backspace => { 
+                            KeyCode::Backspace => {
                                 if show_model_popup { popup_query.pop(); popup_cursor = 0; }
-                                else if !is_nav_mode { 
-                                    input.pop(); 
+                                else if !is_nav_mode {
+                                    input.pop();
                                     suggestion_ghost.clear();
                                     let _ = suggest_tx.try_send(input.clone());
                                 }
@@ -441,12 +614,12 @@ pub async fn run_tui(
                                             drop(s);
                                             let mut sw = llm_engine.state.write().await;
                                             sw.model = id.clone();
-                                            
+
                                             // Persist the choice
                                             let mut config = crate::config::AppConfig::load();
                                             config.selected_model = id;
                                             let _ = config.save();
-                                            
+
                                             show_model_popup = false;
                                         }
                                     }
@@ -459,19 +632,19 @@ pub async fn run_tui(
                                     } else if clean_input == "/report" {
                                         is_generating_report = true;
                                         suggestion_ghost.clear();
-                                        
+
                                         let llm = llm_engine.clone();
                                         let graph_ref = graph.clone();
                                         let rep_tx = report_tx.clone();
                                         let target = target_shared.try_read().map(|t| t.clone()).unwrap_or("Unknown".into());
-                                        
+
                                         tokio::spawn(async move {
                                             let insights = graph_ref.read().await.get_strategic_insights().join("\n");
                                             let prompt = format!(
                                                 "You are an expert offensive security reporting engine. \
                                                  Generate a comprehensive Markdown penetration test report for the target: {}.\n\n\
                                                  INTELLIGENCE TOPOLOGY GRAPH:\n{}\n\n\
-                                                 Make sure to include an Executive Summary, Discovered Scope/Attack Surface, High-Level Vulnerabilities (if any), and Recommendations.", 
+                                                 Make sure to include an Executive Summary, Discovered Scope/Attack Surface, High-Level Vulnerabilities (if any), and Recommendations.",
                                                 target, insights
                                             );
                                             let msgs = vec![json!({"role": "system", "content": prompt})];
@@ -488,7 +661,6 @@ pub async fn run_tui(
                                     suggestion_ghost.clear();
                                 }
                             }
-                            KeyCode::Char('q') if input.trim().is_empty() && !show_model_popup && !active_report.is_some() => break,
                             _ => {}
                         }
                     }
@@ -504,7 +676,11 @@ pub async fn run_tui(
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }

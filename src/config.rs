@@ -25,7 +25,7 @@ impl AppConfig {
                 }
             }
         }
-        
+
         let mut config = Self::default();
         // Fallback to Env if present
         if let Ok(env_model) = std::env::var("LLM_MODEL") {
