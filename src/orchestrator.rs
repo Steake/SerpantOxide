@@ -22,7 +22,7 @@ pub struct Orchestrator {
     search: Arc<NativeWebSearch>,
     graph: Arc<RwLock<ShadowGraph>>,
     target_shared: Arc<RwLock<String>>,
-    tx: Sender<String>,
+    tx: Sender<UiEvent>,
 }
 
 impl Orchestrator {
@@ -34,7 +34,7 @@ impl Orchestrator {
         search: Arc<NativeWebSearch>,
         graph: Arc<RwLock<ShadowGraph>>,
         target_shared: Arc<RwLock<String>>,
-        tx: Sender<String>,
+        tx: Sender<UiEvent>,
     ) -> Self {
         Self {
             llm,
@@ -64,7 +64,7 @@ impl Orchestrator {
 
         let _ = self
             .tx
-            .send(UiEvent::log(format!("Crew mode engaged for {}", target)).serialize())
+            .send(UiEvent::log(format!("Crew mode engaged for {}", target)))
             .await;
 
         let mut current_plan: Vec<String> = Vec::new();
@@ -83,10 +83,10 @@ impl Orchestrator {
             if !response.content.trim().is_empty() {
                 let _ = self
                     .tx
-                    .send(
-                        UiEvent::log(format!("Crew reasoning: {}", response.content.trim()))
-                            .serialize(),
-                    )
+                    .send(UiEvent::log(format!(
+                        "Crew reasoning: {}",
+                        response.content.trim()
+                    )))
                     .await;
             }
 
@@ -195,13 +195,10 @@ impl Orchestrator {
     ) -> Result<String, String> {
         let _ = self
             .tx
-            .send(
-                UiEvent::log(format!(
-                    "Tool call: {} {}",
-                    tool_call.name, tool_call.arguments
-                ))
-                .serialize(),
-            )
+            .send(UiEvent::log(format!(
+                "Tool call: {} {}",
+                tool_call.name, tool_call.arguments
+            )))
             .await;
 
         match tool_call.name.as_str() {
@@ -262,13 +259,10 @@ impl Orchestrator {
                 *current_plan = remaining.clone();
                 let _ = self
                     .tx
-                    .send(
-                        UiEvent::Checklist {
-                            completed,
-                            remaining: remaining.clone(),
-                        }
-                        .serialize(),
-                    )
+                    .send(UiEvent::Checklist {
+                        completed,
+                        remaining: remaining.clone(),
+                    })
                     .await;
                 Ok("Checklist updated.".to_string())
             }
@@ -327,12 +321,9 @@ impl Orchestrator {
     async fn emit_completion(&self, summary: &str) {
         let _ = self
             .tx
-            .send(
-                UiEvent::CrewComplete {
-                    summary: summary.to_string(),
-                }
-                .serialize(),
-            )
+            .send(UiEvent::CrewComplete {
+                summary: summary.to_string(),
+            })
             .await;
     }
 }

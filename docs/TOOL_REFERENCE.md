@@ -97,6 +97,10 @@ Reads and writes shared findings.
 
 Writes to `loot/notes.json`.
 
+### Operational note
+
+Findings written here are not merely warehoused. The graph layer consumes note content where it can, so good notes improve strategic hints and topology context while bad notes merely become durable clutter.
+
 ## `nmap`
 
 Runs a fast scan against a target.
@@ -109,6 +113,7 @@ Runs a fast scan against a target.
 
 - parsed services are ingested into the shadow graph
 - open services are added to worker loot
+- topology summaries and the explorer host view update from that graph state
 
 ## `sqlmap`
 
@@ -122,6 +127,7 @@ Runs `sqlmap` in batch mode against a URL.
 
 - findings are parsed into vulnerability strings
 - vulnerabilities are ingested into the graph
+- web-facing findings then surface in topology intelligence and the explorer rails
 
 ## `osint`
 

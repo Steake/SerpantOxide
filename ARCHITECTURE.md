@@ -14,54 +14,60 @@ The Python implementation proved that a multi-agent penetration-testing workflow
 ## System Overview
 
 ```mermaid
-flowchart TD
-    A[main.rs] --> B[TUI]
-    A --> C[LLM Engine]
-    A --> D[Worker Pool]
-    A --> E[Notes Engine]
-    A --> F[Shadow Graph]
-    A --> G[Browser Engine]
-    A --> H[Web Search]
-    A --> I[Orchestrator]
+flowchart LR
+    A[main.rs] --> B[runtime.rs]
+    B --> C[TUI]
+    B --> D[GPUI App]
+    B --> E[LLM Engine]
+    B --> F[Worker Pool]
+    B --> G[Notes Engine]
+    B --> H[Shadow Graph]
+    B --> I[Browser Engine]
+    B --> J[Web Search]
+    B --> K[Orchestrator]
 
-    I --> C
-    I --> D
-    I --> E
-    I --> F
-    I --> G
-    I --> H
+    K --> E
+    K --> F
+    K --> G
+    K --> H
+    K --> I
+    K --> J
 
-    D --> J[Worker Agent]
-    J --> C
-    J --> E
-    J --> F
-    J --> G
-    J --> H
-    J --> K[Terminal]
-    J --> L[Nmap]
-    J --> M[Sqlmap]
-    J --> N[OSINT]
-    J --> O[Hosting]
-    J --> P[Image Generation]
-    J --> Q[EVM Chain]
+    F --> L[Worker Agent]
+    L --> E
+    L --> G
+    L --> H
+    L --> I
+    L --> J
+    L --> M[Terminal]
+    L --> N[Nmap]
+    L --> O[Sqlmap]
+    L --> P[OSINT]
+    L --> Q[Hosting]
+    L --> R[Image Generation]
+    L --> S[EVM Chain]
 
-    I --> R[UI Events]
-    D --> R
-    J --> R
-    R --> B
+    K --> T[UI Events]
+    F --> T
+    L --> T
+    T --> C
+    T --> D
 ```
 
 ## Core Components
 
 ## 1. Bootstrap and Shared State
 
-`src/main.rs` is the assembly hall. It creates shared state, launches the engines, starts the TUI, and enters the command loop. Its responsibilities are straightforward:
+`src/main.rs` is now mostly a frontend selector and bootstrap point. It loads environment state, boots the shared runtime, and chooses which interface to launch.
 
-- start the event channel used by the UI
+`src/runtime.rs` is the actual assembly hall. Its responsibilities are straightforward:
+
+- create the typed command and event channels
 - load configuration and environment variables
 - construct the LLM, notes, search, graph, browser, and worker pool
 - instantiate the orchestrator
-- route slash commands such as `/crew`, `/agent`, `/report`, and `/target`
+- assemble `RuntimeSnapshot`
+- route `RuntimeCommand` values such as target changes, agent runs, crew runs, report generation, and shutdown
 
 The important thing is not that `main.rs` is clever. It is not. The important thing is that it is explicit.
 
@@ -70,19 +76,41 @@ The important thing is not that `main.rs` is clever. It is not. The important th
 `src/tui.rs` renders the system as an operational console rather than a chat box with delusions of grandeur. The interface has four practical duties:
 
 - show LLM status, model selection, and token telemetry
-- display an ASCII topology derived from the shadow graph
+- display a topology intelligence summary derived from the shadow graph
 - present execution logs and crew checklist state
-- expose worker state, loot, and detail panes
+- expose worker state, loot, tool timelines, and detail panes
+- open a dedicated topology explorer with host selection, peer-relationship canvas, findings, and fullscreen mode
 
-The TUI listens on a JSON event stream defined in `src/events.rs`. At present the event model is intentionally narrow:
+The topology surface now has two layers:
+
+- a compact summary strip in the main console
+- an interactive explorer that can run as a modal or fullscreen workspace
+
+That second layer matters. A topology worth anything must be explorable, not merely printable.
+
+The TUI now listens on the shared typed event stream defined in `src/events.rs` and driven by `runtime.rs`.
+
+At present the event model is intentionally narrow:
 
 - `log`
 - `checklist`
 - `crew_complete`
+- `worker_spawn`
+- `worker_status`
+- `worker_output`
+- `worker_tool`
 
-This is one of the codebase’s more honest choices. Most systems begin with a need for a handful of events and end with an event taxonomy bloated enough to require a civil service. Serpantoxide has not yet succumbed to that temptation.
+This is still disciplined, but it is no longer artificially starved. Once the UI grew clickable workers, live tool timelines, and a topology explorer with focusable panels, structured events became the difference between a console and a superstition.
 
-## 3. The LLM Engine
+## 3. The GPUI Shell
+
+`src/gpui_app.rs` is an experimental macOS-native shell over the same runtime service.
+
+- it is launched explicitly with `--gpui` or through the packaged `.app` bundle
+- it consumes the same runtime snapshots and commands as the TUI
+- it is not yet the default CLI surface because a native shell that cannot reliably outclass the TUI should not pretend otherwise
+
+## 4. The LLM Engine
 
 `src/llm.rs` provides the LLM boundary. It does four things:
 
@@ -93,7 +121,7 @@ This is one of the codebase’s more honest choices. Most systems begin with a n
 
 This mock path is not decorative. It enables UI work, orchestration work, and tool-loop verification without requiring live model traffic. In other words, the code can still be tested when the internet or the budget refuses to cooperate.
 
-## 4. The Orchestrator
+## 5. The Orchestrator
 
 `src/orchestrator.rs` is the crew-level state machine. It is responsible for:
 
@@ -116,7 +144,7 @@ It operates in a bounded loop rather than wandering indefinitely through a swamp
 
 That limitation is a virtue. Strategic layers should delegate and decide; they should not indulge in manually clicking buttons or parsing shell output line by line.
 
-## 5. The Worker Pool
+## 6. The Worker Pool
 
 `src/pool.rs` is the execution broker. It owns worker records, Tokio tasks, and dependency handling. Each worker has:
 
@@ -127,6 +155,7 @@ That limitation is a virtue. Strategic layers should delegate and decide; they s
 - loot
 - result or error
 - tools used
+- tool history with arguments and results
 - priority
 - dependency list
 - timestamps
@@ -135,7 +164,7 @@ The pool does not attempt metaphysics. A worker is queued, running, finished, er
 
 The pool also adapts forced task prefixes. If the orchestrator or operator issues `NMAP: target` or `EVM: action`, the pool rewrites that into natural-language guidance so the worker agent can still operate inside its normal planning loop.
 
-## 6. The Worker Agent
+## 7. The Worker Agent
 
 `src/worker_agent.rs` is the principal instrument of autonomy in the Rust system. A worker:
 
@@ -160,7 +189,7 @@ Each plan step has:
 
 That small enum does more useful work than many systems manage with a cathedral of classes.
 
-## 7. Tooling Layer
+## 8. Tooling Layer
 
 Workers execute native tools. Each tool is intentionally narrow:
 
@@ -199,7 +228,7 @@ Persistent note store in `loot/notes.json`, keyed by category and optionally by 
 
 ### `graph.rs`
 
-A lightweight directed graph used to derive strategic hints from accumulated findings.
+A lightweight directed graph used to derive strategic hints, topology summaries, peer relationships, and interactive explorer snapshots from accumulated findings.
 
 ### `osint.rs`
 
@@ -253,7 +282,7 @@ The data model is intentionally plain:
 - the LLM engine deals in chat messages and tool calls
 - the orchestrator deals in checklist strings and worker IDs
 - the worker agent deals in plan steps and tool results
-- the graph deals in hosts, services, credentials, vulnerabilities, and findings
+- the graph deals in hosts, services, credentials, vulnerabilities, findings, and derived host relationships
 - the note store deals in persistent evidence and metadata
 
 This is not because the domain is simple. It is because the implementation has, so far, resisted the temptation to dignify every string with a thesis-length type wrapper.
@@ -262,7 +291,7 @@ This is not because the domain is simple. It is because the implementation has, 
 
 There are only a few durable pieces of state:
 
-- `.serpantoxide_config` for the selected model
+- `.serpantoxide_config` for the selected model and last target
 - `loot/notes.json` for persistent notes
 - `loot/images/` for generated imagery
 - `loot/artifacts/screenshots/` for captured browser evidence

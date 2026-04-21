@@ -8,6 +8,7 @@ use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
 use crate::llm::{ChatResponse, NativeLLMEngine, ToolCall};
 use crate::notes::NotesEngine;
+use crate::pool::ToolRecord;
 use crate::pool::WorkerPoolState;
 use crate::prompts;
 use crate::sqlmap::NativeSqlmap;
@@ -45,14 +46,14 @@ impl PlanStep {
 pub struct WorkerHandle {
     pub worker_id: String,
     state: Arc<RwLock<WorkerPoolState>>,
-    ui_tx: mpsc::Sender<String>,
+    ui_tx: mpsc::Sender<UiEvent>,
 }
 
 impl WorkerHandle {
     pub fn new(
         worker_id: String,
         state: Arc<RwLock<WorkerPoolState>>,
-        ui_tx: mpsc::Sender<String>,
+        ui_tx: mpsc::Sender<UiEvent>,
     ) -> Self {
         Self {
             worker_id,
@@ -71,23 +72,88 @@ impl WorkerHandle {
         }
         let _ = self
             .ui_tx
-            .send(UiEvent::log(format!("[{}] {}", self.worker_id, message)).serialize())
+            .send(UiEvent::worker_output(self.worker_id.clone(), message))
             .await;
     }
 
     pub async fn set_status(&self, status: &str) {
-        let mut state = self.state.write().await;
-        if let Some(worker) = state.workers.get_mut(&self.worker_id) {
-            worker.status = status.to_string();
+        {
+            let mut state = self.state.write().await;
+            if let Some(worker) = state.workers.get_mut(&self.worker_id) {
+                worker.status = status.to_string();
+            }
         }
+        let _ = self
+            .ui_tx
+            .send(UiEvent::worker_status(self.worker_id.clone(), status.to_string()))
+            .await;
     }
 
-    pub async fn record_tool(&self, tool_name: &str) {
-        let mut state = self.state.write().await;
-        if let Some(worker) = state.workers.get_mut(&self.worker_id) {
-            if !worker.tools_used.iter().any(|name| name == tool_name) {
-                worker.tools_used.push(tool_name.to_string());
+    pub async fn record_tool_call(&self, tool_name: &str, args: &Value) -> usize {
+        let args_string = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+        let tool_id = {
+            let mut state = self.state.write().await;
+            if let Some(worker) = state.workers.get_mut(&self.worker_id) {
+                if !worker.tools_used.iter().any(|name| name == tool_name) {
+                    worker.tools_used.push(tool_name.to_string());
+                }
+                let tool_id = worker.tool_history.len() + 1;
+                worker.tool_history.push(ToolRecord {
+                    id: tool_id,
+                    name: tool_name.to_string(),
+                    args: args_string.clone(),
+                    result: None,
+                });
+                tool_id
+            } else {
+                0
             }
+        };
+        let _ = self
+            .ui_tx
+            .send(
+                UiEvent::WorkerTool {
+                    worker_id: self.worker_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    args: args_string,
+                    result: None,
+                }
+            )
+            .await;
+        tool_id
+    }
+
+    pub async fn complete_tool_call<S: Into<String>>(&self, tool_id: usize, result: S) {
+        let result = result.into();
+        let tool_name = {
+            let mut state = self.state.write().await;
+            if let Some(worker) = state.workers.get_mut(&self.worker_id) {
+                if let Some(tool) = worker
+                    .tool_history
+                    .iter_mut()
+                    .find(|tool| tool.id == tool_id)
+                {
+                    tool.result = Some(result.clone());
+                    Some((tool.name.clone(), tool.args.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((tool_name, args)) = tool_name {
+            let _ = self
+                .ui_tx
+                .send(
+                    UiEvent::WorkerTool {
+                        worker_id: self.worker_id.clone(),
+                        tool_name,
+                        args,
+                        result: Some(result),
+                    }
+                )
+                .await;
         }
     }
 
@@ -184,7 +250,6 @@ impl WorkerAgent {
 
             for tool_call in response.tool_calls {
                 let tool_name = tool_call.name.clone();
-                handle.record_tool(&tool_name).await;
                 let result = self.execute_tool(&tool_call, &mut plan, handle).await?;
                 messages.push(json!({
                     "role": "tool",
@@ -283,6 +348,9 @@ impl WorkerAgent {
         plan: &mut [PlanStep],
         handle: &WorkerHandle,
     ) -> Result<String, String> {
+        let tool_id = handle
+            .record_tool_call(&tool_call.name, &tool_call.arguments)
+            .await;
         handle
             .log(format!(
                 "Tool call: {} {}",
@@ -290,7 +358,7 @@ impl WorkerAgent {
             ))
             .await;
 
-        match tool_call.name.as_str() {
+        let execution = match tool_call.name.as_str() {
             "terminal" => self.execute_terminal(&tool_call.arguments, handle).await,
             "browser" => self.execute_browser(&tool_call.arguments, handle).await,
             "web_search" => self.execute_web_search(&tool_call.arguments, handle).await,
@@ -306,6 +374,23 @@ impl WorkerAgent {
                     .await
             }
             other => Err(format!("Unknown worker tool: {}", other)),
+        };
+
+        match execution {
+            Ok(result) => {
+                if tool_id > 0 {
+                    handle.complete_tool_call(tool_id, result.clone()).await;
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                if tool_id > 0 {
+                    handle
+                        .complete_tool_call(tool_id, format!("ERROR: {}", error))
+                        .await;
+                }
+                Err(error)
+            }
         }
     }
 

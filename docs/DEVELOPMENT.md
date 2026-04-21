@@ -18,10 +18,12 @@ If a change violates one of these, it should face a presumption of guilt.
 
 - `src/main.rs`
 - `src/config.rs`
+- `src/runtime.rs`
 
 ### UI and events
 
 - `src/tui.rs`
+- `src/gpui_app.rs`
 - `src/events.rs`
 
 ### LLM and prompts
@@ -86,15 +88,24 @@ cargo fmt
 cargo check
 ```
 
-## How To Change the TUI
+## How To Change the UI
 
-The TUI is driven by:
+Both frontends are now driven by:
 
 - command input from the user
-- UI events emitted by orchestrator and workers
-- shared state reads from the graph, LLM state, and worker pool
+- typed `RuntimeCommand` values
+- typed `UiEvent` values emitted by orchestrator and workers
+- shared `RuntimeSnapshot` reads assembled by `runtime.rs`
 
-If you need richer UI behavior, do not simply add more log lines and pretend structure has emerged from noise. Extend `UiEvent` in `events.rs`, emit those events at the source, and teach the TUI to render them properly.
+If you need richer UI behavior, do not simply add more log lines and pretend structure has emerged from noise. Extend `UiEvent` in `events.rs`, emit those events at the source, update `runtime.rs` snapshot assembly as needed, and then teach the frontend to render them properly.
+
+Current examples of this principle in action:
+
+- worker lifecycle and streaming output use structured worker events rather than inferred log parsing
+- tool timelines in the agent detail pane are driven by explicit tool-history state
+- the topology explorer reads graph snapshots directly instead of trying to rehydrate meaning from the compact topology strip
+
+The TUI remains the default CLI frontend. The GPUI shell is experimental and should be treated as a native shell under construction, not as the canonical operator workflow.
 
 ## How To Change Prompts
 
@@ -131,14 +142,24 @@ At present, the principal local verification path is compilation and runtime exe
 cargo fmt
 cargo check
 cargo run
+cargo run -- --gpui
 ```
 
 There is room for a more formal test suite, particularly around:
 
 - worker tool execution helpers
 - graph extraction and ingestion
+- topology snapshot and relationship derivation
+- text-canvas topology rendering
 - orchestration tool handling
 - event serialization
+
+For macOS packaging work, also verify:
+
+```bash
+bash -n scripts/package_macos_app.sh
+scripts/package_macos_app.sh --help
+```
 
 That work remains to be done.
 
@@ -146,7 +167,7 @@ That work remains to be done.
 
 ### The graph is intentionally small
 
-It is useful, but not yet sophisticated. Resist the urge to turn it into a grand ontological machine before the operational need is proven.
+It is useful, but not yet sophisticated. Resist the urge to turn it into a grand ontological machine before the operational need is proven. The current topology explorer works because the graph derives just enough structure to support host lists, peer links, and findings; it does not require a doctoral thesis in graph theory.
 
 ### Tool wrappers are opportunistic
 
@@ -164,5 +185,6 @@ If you change architecture materially, update:
 - `ARCHITECTURE.md`
 - `docs/TOOL_REFERENCE.md`
 - `docs/OPERATIONS.md`
+- `docs/macos-gpui-frontend-spec.md` when the native-shell behavior or rollout assumptions change
 
 The cardinal sin of technical documentation is not incompleteness. It is falsehood. An outdated architecture document is a lie written in Markdown.

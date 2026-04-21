@@ -23,6 +23,30 @@ cd Serpantoxide
 cargo run
 ```
 
+### 2a. Frontend Selection
+
+```bash
+# Default CLI TUI
+cargo run
+
+# Experimental macOS GPUI shell
+cargo run -- --gpui
+
+# Force the TUI explicitly
+cargo run -- --tui
+```
+
+The CLI default is the TUI. The GPUI shell exists, but remains opt-in on macOS until it is visually and operationally less suspect.
+
+### 2b. Package a macOS App Bundle
+
+```bash
+scripts/package_macos_app.sh
+scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
+```
+
+The bundle launcher starts the binary with `--gpui` and stages a bundle-local runtime directory under `Contents/Resources/runtime`.
+
 ### 3. Verification
 
 ```bash
@@ -55,17 +79,20 @@ ETHERSCAN_API_KEY=...
 
 ## Local Configuration
 
-Serpantoxide persists its selected model to:
+Serpantoxide persists its selected model and last target to:
 
 ```text
 .serpantoxide_config
 ```
 
+When running from the packaged macOS app bundle, the config file is stored inside the bundle runtime directory pointed to by `SERPANTOXIDE_HOME`, rather than in the repository checkout.
+
 The format is plain JSON:
 
 ```json
 {
-  "selected_model": "openai/gpt-4o"
+  "selected_model": "openai/gpt-4o",
+  "last_target": "example.org"
 }
 ```
 
@@ -77,6 +104,7 @@ The format is plain JSON:
 /agent <task>
 /crew <task>
 /target <host>
+/topology
 /report
 ```
 
@@ -129,6 +157,34 @@ loot/images/
 
 ## Operational Modes
 
+### TUI Interaction Model
+
+The Rust console is no longer a keyboard-only sermon delivered by a machine to a captive audience.
+
+- worker output streams live into the interface while runs are active
+- click an agent in the right rail to open its detail pane
+- click a tool in the agent pane to inspect arguments and output
+- click the topology strip to open the topology explorer
+- use `/topology` to open the explorer directly in fullscreen mode
+
+The TUI is the supported CLI surface today.
+
+### GPUI Shell
+
+The macOS GPUI shell is available through `--gpui` or through the packaged `.app` bundle launcher.
+
+- it uses the same runtime service as the TUI
+- it is not yet feature-complete relative to the TUI
+- if it looks wrong, use the TUI and treat the shell as an experimental native frontend rather than a finished operator console
+
+Inside the topology explorer:
+
+- `Tab` or left/right switches focus between `Hosts`, `Selected Host Detail`, `Host Graph Canvas`, and `Findings / Access`
+- up/down acts on the focused panel
+- `Enter` or `f` toggles fullscreen
+- mouse wheel scrolls the panel under the cursor
+- `Esc` closes the explorer
+
 ### Mock mode
 
 If `OPENROUTER_API_KEY` is absent, the LLM engine enters deterministic mock mode. This is useful for:
@@ -156,6 +212,15 @@ The browser engine uses `chromiumoxide` and maintains one active page reference.
 - JavaScript execution
 
 If no page is active, interactive actions will fail until navigation occurs first. This is not a bug. It is causality.
+
+## Topology Explorer Notes
+
+The topology explorer is driven by graph snapshots rather than by reverse-engineering its own rendered text, which would be an excellent method if one wished to go mad.
+
+- host relationships are inferred from shared `/24` subnet, shared services, and shared credentials
+- the graph canvas is an ASCII layout, not a graphical viewport
+- the selected host is the center of the local relationship map
+- the detail pane shows the active peer-link rationale while the canvas shows the spatial arrangement
 
 ## Common Failure Modes
 

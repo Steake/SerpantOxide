@@ -13,6 +13,14 @@ use crate::web_search::NativeWebSearch;
 use crate::worker_agent::{WorkerAgent, WorkerHandle};
 
 #[derive(Clone, Debug)]
+pub struct ToolRecord {
+    pub id: usize,
+    pub name: String,
+    pub args: String,
+    pub result: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct WorkerInfo {
     pub id: String,
     pub task: String,
@@ -23,6 +31,7 @@ pub struct WorkerInfo {
     pub result: Option<String>,
     pub error: Option<String>,
     pub tools_used: Vec<String>,
+    pub tool_history: Vec<ToolRecord>,
     pub priority: i64,
     pub depends_on: Vec<String>,
     pub started_at: Option<u64>,
@@ -43,12 +52,12 @@ pub struct WorkerPool {
     graph: Arc<RwLock<ShadowGraph>>,
     search: Arc<NativeWebSearch>,
     browser: Option<Arc<crate::browser::NativeBrowserEngine>>,
-    pub event_tx: mpsc::Sender<String>,
+    pub event_tx: mpsc::Sender<UiEvent>,
 }
 
 impl WorkerPool {
     pub fn new(
-        event_tx: mpsc::Sender<String>,
+        event_tx: mpsc::Sender<UiEvent>,
         llm: Arc<NativeLLMEngine>,
         notes: Arc<NotesEngine>,
         graph: Arc<RwLock<ShadowGraph>>,
@@ -87,6 +96,7 @@ impl WorkerPool {
                     result: None,
                     error: None,
                     tools_used: Vec::new(),
+                    tool_history: Vec::new(),
                     priority,
                     depends_on: depends_on.clone(),
                     started_at: None,
@@ -98,7 +108,7 @@ impl WorkerPool {
 
         let _ = self
             .event_tx
-            .send(UiEvent::log(format!("Spawned {} -> {}", worker_id, task)).serialize())
+            .send(UiEvent::worker_spawn(worker_id.clone(), task.clone()))
             .await;
 
         let pool = self.clone();
@@ -187,7 +197,7 @@ impl WorkerPool {
             handle.abort();
             let _ = self
                 .event_tx
-                .send(UiEvent::log(format!("Cancelled {}", agent_id)).serialize())
+                .send(UiEvent::log(format!("Cancelled {}", agent_id)))
                 .await;
             return true;
         }
@@ -218,20 +228,32 @@ impl WorkerPool {
         workers
     }
 
+    pub async fn get_worker(&self, agent_id: &str) -> Option<WorkerInfo> {
+        let state = self.state.read().await;
+        state.workers.get(agent_id).cloned()
+    }
+
     async fn run_worker(&self, worker_id: String, task: String, depends_on: Vec<String>) {
+        let handle =
+            WorkerHandle::new(worker_id.clone(), self.state.clone(), self.event_tx.clone());
+
         if !depends_on.is_empty() {
+            handle
+                .log(format!(
+                    "Waiting for dependencies: {}",
+                    depends_on.join(", ")
+                ))
+                .await;
             self.wait_for(Some(depends_on)).await;
         }
 
         self.update_worker(&worker_id, |worker| {
-            worker.status = "Running".to_string();
             worker.started_at = Some(now_epoch_secs());
-            worker.logs.push("Worker runtime booted.".to_string());
         })
         .await;
+        handle.set_status("Running").await;
+        handle.log("Worker runtime booted.").await;
 
-        let handle =
-            WorkerHandle::new(worker_id.clone(), self.state.clone(), self.event_tx.clone());
         let agent = WorkerAgent::new(
             self.llm.clone(),
             self.notes.clone(),
@@ -245,29 +267,27 @@ impl WorkerPool {
 
         match execution {
             Ok(result) => {
+                handle.set_status("Finished").await;
                 self.update_worker(&worker_id, |worker| {
-                    worker.status = "Finished".to_string();
                     worker.result = Some(result.clone());
                     worker.finished_at = Some(now_epoch_secs());
                 })
                 .await;
-                let _ = self
-                    .event_tx
-                    .send(UiEvent::log(format!("{} completed", worker_id)).serialize())
-                    .await;
+                if !result.trim().is_empty() {
+                    handle
+                        .log(format!("Final summary: {}", result.trim()))
+                        .await;
+                }
+                handle.log("Worker completed successfully.").await;
             }
             Err(error) => {
+                handle.set_status("Error").await;
                 self.update_worker(&worker_id, |worker| {
-                    worker.status = "Error".to_string();
                     worker.error = Some(error.clone());
                     worker.finished_at = Some(now_epoch_secs());
-                    worker.logs.push(format!("ERROR: {}", error));
                 })
                 .await;
-                let _ = self
-                    .event_tx
-                    .send(UiEvent::log(format!("{} failed: {}", worker_id, error)).serialize())
-                    .await;
+                handle.log(format!("ERROR: {}", error)).await;
             }
         }
     }

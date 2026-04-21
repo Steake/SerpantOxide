@@ -1,4 +1,5 @@
 /target
 /.serpantoxide_config
+scan_results.txt
 **/*.rs.bk
 .DS_Store

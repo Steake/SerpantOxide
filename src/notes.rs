@@ -5,7 +5,7 @@ use std::fs;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Note {
     #[serde(default)]
     pub key: String,
@@ -47,6 +47,10 @@ impl NotesEngine {
     pub async fn get_notes_by_category(&self, category: &str) -> Vec<Note> {
         let map = self.store.read().await;
         map.get(category).cloned().unwrap_or_default()
+    }
+
+    pub async fn all_notes(&self) -> HashMap<String, Vec<Note>> {
+        self.store.read().await.clone()
     }
 
     pub async fn upsert_note(

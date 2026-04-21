@@ -54,6 +54,17 @@ pub struct NativeLLMEngine {
     pub state: Arc<RwLock<LLMState>>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LlmTelemetrySnapshot {
+    pub model: String,
+    pub status: String,
+    pub is_thinking: bool,
+    pub last_latency_ms: u64,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub available_models: Vec<OpenRouterModel>,
+}
+
 impl NativeLLMEngine {
     pub async fn launch() -> Result<Self, String> {
         let client = Client::builder()
@@ -115,12 +126,19 @@ impl NativeLLMEngine {
             return Ok(());
         }
 
-        let res = self
+        let res = match self
             .client
             .get("https://openrouter.ai/api/v1/models")
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(res) => res,
+            Err(e) => {
+                let message = format!("Model list fetch failed: {}", e);
+                self.set_status_message(message.clone()).await;
+                return Err(message);
+            }
+        };
         if res.status().is_success() {
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
             if let Some(models) = data["data"].as_array() {
@@ -143,8 +161,39 @@ impl NativeLLMEngine {
                 let mut s = self.state.write().await;
                 s.available_models = parsed;
             }
+        } else {
+            let status = res.status();
+            let err_body = res.text().await.unwrap_or_default();
+            let message = summarize_provider_error(status.as_u16(), &err_body);
+            self.set_status_message(format!("Model list error: {}", message))
+                .await;
+            return Err(message);
         }
         Ok(())
+    }
+
+    pub async fn set_model(&self, model_id: String) -> Result<(), String> {
+        {
+            let mut state = self.state.write().await;
+            state.model = model_id.clone();
+        }
+
+        let mut config = crate::config::AppConfig::load();
+        config.selected_model = model_id;
+        config.save()
+    }
+
+    pub async fn telemetry_snapshot(&self) -> LlmTelemetrySnapshot {
+        let state = self.state.read().await;
+        LlmTelemetrySnapshot {
+            model: state.model.clone(),
+            status: state.status.clone(),
+            is_thinking: state.is_thinking,
+            last_latency_ms: state.last_latency_ms,
+            prompt_tokens: state.prompt_tokens,
+            completion_tokens: state.completion_tokens,
+            available_models: state.available_models.clone(),
+        }
     }
 
     pub async fn generate_with_history(
@@ -205,7 +254,7 @@ impl NativeLLMEngine {
             payload["tool_choice"] = json!("auto");
         }
 
-        let response = self
+        let response = match self
             .client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -214,7 +263,15 @@ impl NativeLLMEngine {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                let detail = format!("Provider request failed: {}", e);
+                self.fail_request(start_time.elapsed().as_millis() as u64, &detail)
+                    .await;
+                return Err(detail);
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -222,12 +279,10 @@ impl NativeLLMEngine {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error body".to_string());
-            self.finish_request(start_time.elapsed().as_millis() as u64, None)
+            let message = summarize_provider_error(status.as_u16(), &err_body);
+            self.fail_request(start_time.elapsed().as_millis() as u64, &message)
                 .await;
-            return Err(format!(
-                "Native LLM Completion Error HTTP Code: {} -> {}",
-                status, err_body
-            ));
+            return Err(message);
         }
 
         let duration = start_time.elapsed().as_millis() as u64;
@@ -286,11 +341,24 @@ impl NativeLLMEngine {
             "messages": [
                 {
                     "role": "system",
-                    "content": format!("You are an auto-complete AI for a pentest framework terminal. The user's input so far is: '{}'\nContext: {}\n\nProvide ONLY the immediate completion text without repeating their start string. No quotes, no markdown, max 3 words.", partial_input, context)
+                    "content": format!(
+                        "You complete operator input for a pentest terminal.\n\
+                         Existing input: {:?}\n\
+                         Context: {}\n\n\
+                         Return ONLY the exact characters to append next.\n\
+                         Rules:\n\
+                         - do not repeat or paraphrase the existing input\n\
+                         - do not explain anything\n\
+                         - do not include quotes, markdown, labels, or newlines\n\
+                         - if unsure, return an empty string\n\
+                         - maximum 18 characters",
+                        partial_input,
+                        context
+                    )
                 }
             ],
-            "max_tokens": 15,
-            "temperature": 0.2
+            "max_tokens": 12,
+            "temperature": 0.0
         });
 
         if self.api_key == "MOCK_KEY" {
@@ -301,7 +369,7 @@ impl NativeLLMEngine {
             return Ok("".to_string());
         }
 
-        let response = self
+        let response = match self
             .client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -310,10 +378,24 @@ impl NativeLLMEngine {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                let message = format!("Autocomplete request failed: {}", e);
+                self.set_status_message(message.clone()).await;
+                return Err(message);
+            }
+        };
 
         if !response.status().is_success() {
-            return Ok("".to_string()); // Silent fail for completion
+            let status = response.status();
+            let err_body = response.text().await.unwrap_or_default();
+            let message = format!(
+                "Autocomplete unavailable: {}",
+                summarize_provider_error(status.as_u16(), &err_body)
+            );
+            self.set_status_message(message.clone()).await;
+            return Err(message);
         }
 
         let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
@@ -323,7 +405,7 @@ impl NativeLLMEngine {
             .trim()
             .to_string();
 
-        Ok(output)
+        Ok(normalize_completion_suffix(partial_input, &output))
     }
 
     async fn finish_request(&self, duration: u64, usage: Option<Usage>) {
@@ -333,6 +415,21 @@ impl NativeLLMEngine {
         s.last_latency_ms = duration;
         s.prompt_tokens = usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
         s.completion_tokens = usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+    }
+
+    async fn fail_request(&self, duration: u64, status: &str) {
+        let mut s = self.state.write().await;
+        s.is_thinking = false;
+        s.status = status.to_string();
+        s.last_latency_ms = duration;
+        s.prompt_tokens = 0;
+        s.completion_tokens = 0;
+    }
+
+    async fn set_status_message<S: Into<String>>(&self, status: S) {
+        let mut s = self.state.write().await;
+        s.status = status.into();
+        s.is_thinking = false;
     }
 
     fn mock_response(
@@ -567,5 +664,99 @@ impl NativeLLMEngine {
                 total_tokens: 174,
             }),
         }
+    }
+}
+
+fn normalize_completion_suffix(partial_input: &str, raw_output: &str) -> String {
+    let candidate = raw_output
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+
+    if candidate.is_empty() {
+        return String::new();
+    }
+
+    if let Some(stripped) = candidate.strip_prefix(partial_input) {
+        return stripped.to_string();
+    }
+
+    let lower_partial = partial_input.to_lowercase();
+    let lower_candidate = candidate.to_lowercase();
+    if lower_candidate.starts_with(&lower_partial) {
+        return candidate
+            .chars()
+            .skip(partial_input.chars().count())
+            .collect();
+    }
+
+    if candidate.contains("The user's input so far")
+        || candidate.contains("Provide ONLY")
+        || candidate.contains("Context:")
+    {
+        return String::new();
+    }
+
+    if candidate.contains('\n')
+        || candidate.contains(':')
+        || candidate.contains('{')
+        || candidate.contains('}')
+        || candidate.contains('[')
+        || candidate.contains(']')
+        || candidate.chars().count() > 24
+        || candidate.split_whitespace().count() > 4
+    {
+        return String::new();
+    }
+
+    if partial_input.starts_with('/') {
+        return String::new();
+    }
+
+    candidate
+}
+
+fn summarize_provider_error(status_code: u16, body: &str) -> String {
+    let parsed_message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("error")
+                .and_then(|value| {
+                    value
+                        .get("message")
+                        .and_then(|msg| msg.as_str())
+                        .or_else(|| value.as_str())
+                })
+                .or_else(|| json.get("message").and_then(|msg| msg.as_str()))
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+
+    let compact = if parsed_message.is_empty() {
+        format!("HTTP {}", status_code)
+    } else {
+        parsed_message
+    };
+
+    match status_code {
+        401 => format!("Provider rejected credentials (HTTP 401): {}", compact),
+        402 => format!(
+            "Provider refused request for billing reasons (HTTP 402): {}",
+            compact
+        ),
+        403 => format!("Provider denied access (HTTP 403): {}", compact),
+        404 => format!("Model or route not available (HTTP 404): {}", compact),
+        408 => format!("Provider timed out (HTTP 408): {}", compact),
+        429 => format!("Rate limited by provider (HTTP 429): {}", compact),
+        500..=599 => format!(
+            "Provider failed upstream (HTTP {}): {}",
+            status_code, compact
+        ),
+        _ => format!("Provider error (HTTP {}): {}", status_code, compact),
     }
 }

@@ -7,13 +7,14 @@
 
 </div>
 
-Serpantoxide exists for an unfashionable but necessary reason: orchestration ought not to be fragile, sluggish, or dependent on a tower of runtime excuses. The Rust binary takes the operational heart of PentestAgent, namely multi-agent delegation, terminal tooling, browser automation, note persistence, graph intelligence, and the terminal UI, and places it under a regime of explicit state, bounded concurrency, and sternly typed control flow.
+Serpantoxide exists for an unfashionable but necessary reason: orchestration ought not to be fragile, sluggish, or dependent on a tower of runtime excuses. The Rust binary takes the operational heart of PentestAgent, namely multi-agent delegation, terminal tooling, browser automation, note persistence, graph intelligence, and its operator interfaces, and places it under a regime of explicit state, bounded concurrency, and sternly typed control flow.
 
-This is not an abstract research toy. It is a working offensive-security console with a crew orchestrator, autonomous worker agents, native browser control, and a telemetry-rich TUI. Where the Python system proved the thesis, Serpantoxide attempts the less glamorous labor of enforcement.
+This is not an abstract research toy. It is a working offensive-security console with a crew orchestrator, autonomous worker agents, native browser control, and a shared runtime that currently feeds a production TUI and an experimental macOS GPUI shell. Where the Python system proved the thesis, Serpantoxide attempts the less glamorous labor of enforcement.
 
 ## What It Does
 
-- Runs a Ratatui-based terminal interface with model telemetry, topology, logs, checklist state, and worker inspection.
+- Runs a Ratatui-based terminal interface with model telemetry, live worker streaming, clickable topology exploration, logs, checklist state, worker inspection, and tool-detail modals.
+- Exposes an experimental macOS GPUI shell when launched with `--gpui`, while keeping the TUI as the default CLI frontend.
 - Uses an LLM-driven crew orchestrator to spawn, wait on, cancel, and synthesize worker activity.
 - Runs worker agents as iterative tool-calling loops with planning, replanning, step completion, and final summaries.
 - Provides native worker tools for `terminal`, `browser`, `web_search`, `notes`, `nmap`, `sqlmap`, `osint`, `hosting`, `image_gen`, and `evm_chain`.
@@ -46,6 +47,26 @@ cd Serpantoxide
 cargo run
 ```
 
+### Frontends
+
+```bash
+# Default CLI frontend
+cargo run
+
+# Experimental macOS native shell
+cargo run -- --gpui
+
+# Force the TUI explicitly
+cargo run -- --tui
+```
+
+### Package macOS App Bundle
+
+```bash
+scripts/package_macos_app.sh
+scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
+```
+
 ### Useful Runtime Commands
 
 ```text
@@ -55,6 +76,7 @@ cargo run
 /tools               Show worker capabilities
 /notes [category]    Show stored findings
 /memory              Show graph-derived intelligence
+/topology            Open the interactive topology explorer
 /prompt              Show the crew prompt
 /report              Generate a markdown report
 /modes               Show mode and prefix help
@@ -63,17 +85,32 @@ cargo run
 
 ## Runtime Model
 
-Serpantoxide has three operational layers:
+Serpantoxide has four operational layers:
 
-1. `main.rs` boots engines, starts the TUI, and wires shared state.
-2. `orchestrator.rs` acts as mission control. It decides whether to spawn workers, wait for them, revise the checklist, or end the run.
-3. `worker_agent.rs` performs the grubby work. Each worker plans, uses tools, marks steps complete or failed, and produces a summary.
+1. `main.rs` selects the frontend and boots the shared runtime.
+2. `runtime.rs` wires engines, command handling, typed UI events, and runtime snapshots.
+3. `orchestrator.rs` acts as mission control. It decides whether to spawn workers, wait for them, revise the checklist, or end the run.
+4. `worker_agent.rs` performs the grubby work. Each worker plans, uses tools, marks steps complete or failed, and produces a summary.
 
 The design is not subtle:
 
 - The orchestrator thinks in campaigns.
 - The workers think in concrete steps.
-- The TUI tells you whether either of them has lost the plot.
+- The TUI remains the default CLI surface and tells you whether either of them has lost the plot, now through typed runtime events rather than ad hoc message scraping.
+- The GPUI shell is intentionally opt-in until its interaction model and text rendering are no longer embarrassing.
+
+## Topology Explorer
+
+The topology view is no longer a decorative strip of ASCII penitence.
+
+- The top panel shows a concise topology intelligence summary.
+- Clicking that panel opens a dedicated topology explorer.
+- `/topology` opens the explorer directly in fullscreen mode.
+- The explorer contains a host list, selected-host detail, a text graph canvas for peer layout, and a findings/access rail.
+- Agent output continues streaming while the UI opens worker detail panes and topology surfaces.
+- `Tab` or left/right switches focus between topology panels.
+- Up/down navigates the focused panel.
+- `Enter` or `f` toggles fullscreen while the explorer is open.
 
 ## Native Tool Surface
 
@@ -106,7 +143,7 @@ EVM: <action and address/query>
 
 ## Configuration
 
-Serpantoxide loads its selected model from `.serpantoxide_config` and falls back to `LLM_MODEL` when that file is absent. The LLM engine itself uses OpenRouter when `OPENROUTER_API_KEY` is present and enters deterministic mock mode otherwise.
+Serpantoxide loads its local runtime state from `.serpantoxide_config` and falls back to `LLM_MODEL` when that file is absent. The file currently persists the selected model and last target. The LLM engine itself uses OpenRouter when `OPENROUTER_API_KEY` is present and enters deterministic mock mode otherwise.
 
 Common environment variables:
 
@@ -125,7 +162,9 @@ LLM_MODEL=openai/gpt-4o
 Serpantoxide/
   src/
     main.rs           Boot sequence and command loop
+    runtime.rs        Shared runtime service and typed command/event layer
     tui.rs            Ratatui interface
+    gpui_app.rs       Experimental macOS GPUI shell
     orchestrator.rs   Crew orchestration loop
     pool.rs           Worker lifecycle and dependency handling
     worker_agent.rs   Autonomous worker agent
