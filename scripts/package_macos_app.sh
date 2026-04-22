@@ -81,13 +81,8 @@ cd "${PROJECT_ROOT}"
 
 if [[ -z "${APP_VERSION}" ]]; then
   APP_VERSION="$(
-    python3 - <<'PY'
-import pathlib
-import tomllib
-
-package = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]
-print(package["version"])
-PY
+    cargo metadata --format-version 1 --no-deps \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])'
   )"
 fi
 
