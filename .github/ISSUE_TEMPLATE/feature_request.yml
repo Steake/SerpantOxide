@@ -1,0 +1,52 @@
+name: Feature Request
+description: Propose a new capability or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the operational or developer pain point this addresses
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see added or changed?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area of the codebase
+      options:
+        - Orchestrator
+        - Worker agent
+        - Worker tool (new)
+        - Worker tool (existing)
+        - TUI
+        - GPUI shell
+        - Graph / topology intelligence
+        - Note store
+        - LLM engine
+        - Build / CI / release
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you weigh?
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to open a pull request for this

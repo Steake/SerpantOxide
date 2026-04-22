@@ -2,6 +2,14 @@
 name = "Serpantoxide"
 version = "0.1.0"
 edition = "2024"
+description = "A Rust command centre for autonomous security operations — orchestrator, worker agents, TUI, and native offensive-security tooling in one binary."
+homepage = "https://github.com/Steake/SerpantOxide"
+repository = "https://github.com/Steake/SerpantOxide"
+license = "MIT"
+keywords = ["security", "pentesting", "agent", "tui", "osint"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
+rust-version = "1.85"
 
 [dependencies]
 rustpython-vm = { version = "0.4.0", features = ["freeze-stdlib"] }
