@@ -1,33 +1,26 @@
-<div align="center">
-
-<img src="../assets/pentestagent-logo.png" alt="PentestAgent Logo" width="180" />
-
 # Serpantoxide
-### The Rust Nerve Center for PentestAgent
 
-</div>
+Serpantoxide is the Rust command nerve-centre for autonomous security operations. It exists because orchestration is too important to leave in the custody of ad hoc glue, runtime whim, and the usual theatrical promises about agentic systems. The point here is not to sound futuristic. The point is to make the machinery behave.
 
-Serpantoxide exists for an unfashionable but necessary reason: orchestration ought not to be fragile, sluggish, or dependent on a tower of runtime excuses. The Rust binary takes the operational heart of PentestAgent, namely multi-agent delegation, terminal tooling, browser automation, note persistence, graph intelligence, and its operator interfaces, and places it under a regime of explicit state, bounded concurrency, and sternly typed control flow.
+This repository contains a working offensive-security console with a crew orchestrator, iterative worker agents, browser control, note persistence, topology intelligence, and two operator surfaces: a production TUI and an experimental macOS GPUI shell. It is not a philosophy seminar disguised as a framework. It is an instrument.
 
-This is not an abstract research toy. It is a working offensive-security console with a crew orchestrator, autonomous worker agents, native browser control, and a shared runtime that currently feeds a production TUI and an experimental macOS GPUI shell. Where the Python system proved the thesis, Serpantoxide attempts the less glamorous labor of enforcement.
+## What It Actually Does
 
-## What It Does
-
-- Runs a Ratatui-based terminal interface with model telemetry, live worker streaming, clickable topology exploration, logs, checklist state, worker inspection, and tool-detail modals.
-- Exposes an experimental macOS GPUI shell when launched with `--gpui`, while keeping the TUI as the default CLI frontend.
-- Uses an LLM-driven crew orchestrator to spawn, wait on, cancel, and synthesize worker activity.
-- Runs worker agents as iterative tool-calling loops with planning, replanning, step completion, and final summaries.
-- Provides native worker tools for `terminal`, `browser`, `web_search`, `notes`, `nmap`, `sqlmap`, `osint`, `hosting`, `image_gen`, and `evm_chain`.
-- Persists findings to `loot/notes.json` and derives strategic hints through a lightweight graph model.
-- Falls back to deterministic mock behavior when the OpenRouter key is absent, which is a practical concession to development rather than an act of mystical foresight.
+- Runs a Ratatui-based terminal interface with live telemetry, worker logs, topology views, and inspection panes.
+- Exposes an experimental macOS GPUI frontend with the same shared runtime.
+- Uses an LLM-driven orchestrator to plan, spawn, monitor, and synthesize worker activity.
+- Executes worker agents as stepwise tool-calling loops with replanning and final summaries.
+- Provides native tools for `terminal`, `browser`, `web_search`, `notes`, `nmap`, `sqlmap`, `osint`, `hosting`, `image_gen`, and `evm_chain`.
+- Persists findings in `loot/notes.json` and builds higher-level hints through a lightweight graph model.
+- Falls back to deterministic mock behavior when the LLM provider key is absent, which is less glamorous than calling it magic and considerably more accurate.
 
 ## Quick Start
 
 ### Requirements
 
 - Rust toolchain with `cargo`
-- Chromium or compatible browser environment for `chromiumoxide`
-- Optional native binaries for tool execution:
+- Chromium or a compatible browser runtime for `chromiumoxide`
+- Optional native binaries:
   - `nmap`
   - `sqlmap`
   - `holehe`
@@ -43,31 +36,30 @@ This is not an abstract research toy. It is a working offensive-security console
 ### Run
 
 ```bash
-cd Serpantoxide
 cargo run
 ```
 
 ### Frontends
 
 ```bash
-# Default CLI frontend
+# Default interface
 cargo run
 
-# Experimental macOS native shell
+# Experimental macOS shell
 cargo run -- --gpui
 
 # Force the TUI explicitly
 cargo run -- --tui
 ```
 
-### Package macOS App Bundle
+### Package The macOS App
 
 ```bash
 scripts/package_macos_app.sh
 scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
 ```
 
-### Useful Runtime Commands
+## Runtime Commands
 
 ```text
 /agent <task>        Run a focused autonomous assessment
@@ -83,51 +75,31 @@ scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
 /quit                Exit
 ```
 
-## Runtime Model
+## Architecture In Four Parts
 
-Serpantoxide has four operational layers:
+1. `main.rs` selects the frontend and boots the runtime.
+2. `runtime.rs` provides the shared command, event, and snapshot layer.
+3. `orchestrator.rs` thinks in campaigns and delegates work.
+4. `worker_agent.rs` does the grubby business of using tools, marking progress, and coming back with something worth reading.
 
-1. `main.rs` selects the frontend and boots the shared runtime.
-2. `runtime.rs` wires engines, command handling, typed UI events, and runtime snapshots.
-3. `orchestrator.rs` acts as mission control. It decides whether to spawn workers, wait for them, revise the checklist, or end the run.
-4. `worker_agent.rs` performs the grubby work. Each worker plans, uses tools, marks steps complete or failed, and produces a summary.
+That division is deliberate. The orchestrator is there to think in terms larger than a shell command, and the workers are there to stop those thoughts from remaining ornamental.
 
-The design is not subtle:
+## Tool Surface
 
-- The orchestrator thinks in campaigns.
-- The workers think in concrete steps.
-- The TUI remains the default CLI surface and tells you whether either of them has lost the plot, now through typed runtime events rather than ad hoc message scraping.
-- The GPUI shell is intentionally opt-in until its interaction model and text rendering are no longer embarrassing.
+Workers can call:
 
-## Topology Explorer
+- `terminal`
+- `browser`
+- `web_search`
+- `notes`
+- `nmap`
+- `sqlmap`
+- `osint`
+- `hosting`
+- `image_gen`
+- `evm_chain`
 
-The topology view is no longer a decorative strip of ASCII penitence.
-
-- The top panel shows a concise topology intelligence summary.
-- Clicking that panel opens a dedicated topology explorer.
-- `/topology` opens the explorer directly in fullscreen mode.
-- The explorer contains a host list, selected-host detail, a text graph canvas for peer layout, and a findings/access rail.
-- Agent output continues streaming while the UI opens worker detail panes and topology surfaces.
-- `Tab` or left/right switches focus between topology panels.
-- Up/down navigates the focused panel.
-- `Enter` or `f` toggles fullscreen while the explorer is open.
-
-## Native Tool Surface
-
-Workers can call the following tools:
-
-- `terminal`: shell execution with working directory, stdin input, and optional privilege escalation.
-- `browser`: navigate, inspect content, enumerate links/forms, click, type, take screenshots, and execute JavaScript.
-- `web_search`: Tavily-backed target research.
-- `notes`: shared durable findings.
-- `nmap`: fast host and service discovery.
-- `sqlmap`: injection verification.
-- `osint`: `holehe`, `sherlock`, `theHarvester`.
-- `hosting`: lightweight local HTTP exposure for generated or staged artifacts.
-- `image_gen`: image generation via Google’s image-capable models.
-- `evm_chain`: RPC and explorer-backed EVM analysis.
-
-There is also a forced-prefix path for explicit worker intent:
+Forced intent prefixes are also supported:
 
 ```text
 NMAP: <host>
@@ -143,7 +115,7 @@ EVM: <action and address/query>
 
 ## Configuration
 
-Serpantoxide loads its local runtime state from `.serpantoxide_config` and falls back to `LLM_MODEL` when that file is absent. The file currently persists the selected model and last target. The LLM engine itself uses OpenRouter when `OPENROUTER_API_KEY` is present and enters deterministic mock mode otherwise.
+Serpantoxide stores local runtime state in `.serpantoxide_config` and falls back to `LLM_MODEL` when that file is absent. OpenRouter is used when `OPENROUTER_API_KEY` is present; otherwise the runtime drops into deterministic mock behavior. This is not deception. It is merely the difference between a live provider and a rehearsal room.
 
 Common environment variables:
 
@@ -156,50 +128,49 @@ EVM_RPC_URL=...
 LLM_MODEL=openai/gpt-4o
 ```
 
-## Project Layout
+## Repository Layout
 
 ```text
-Serpantoxide/
-  src/
-    main.rs           Boot sequence and command loop
-    runtime.rs        Shared runtime service and typed command/event layer
-    tui.rs            Ratatui interface
-    gpui_app.rs       Experimental macOS GPUI shell
-    orchestrator.rs   Crew orchestration loop
-    pool.rs           Worker lifecycle and dependency handling
-    worker_agent.rs   Autonomous worker agent
-    llm.rs            OpenRouter integration and mock path
-    browser.rs        Native browser automation
-    notes.rs          Persistent note store
-    graph.rs          Shadow graph and strategic hints
-    terminal.rs       Shell execution
-    nmap.rs           Nmap integration
-    sqlmap.rs         Sqlmap integration
-    osint.rs          OSINT tool wrappers
-    hosting.rs        Local file hosting
-    image_gen.rs      Image generation
-    evm_chain.rs      EVM chain tooling
-    prompts.rs        Orchestrator and worker prompt text
-    events.rs         UI event envelopes
-    config.rs         Local configuration
+src/
+  main.rs
+  runtime.rs
+  tui.rs
+  gpui_app.rs
+  orchestrator.rs
+  pool.rs
+  worker_agent.rs
+  llm.rs
+  browser.rs
+  notes.rs
+  graph.rs
+  terminal.rs
+  nmap.rs
+  sqlmap.rs
+  osint.rs
+  hosting.rs
+  image_gen.rs
+  evm_chain.rs
+  prompts.rs
+  events.rs
+  config.rs
 ```
 
-## Documentation Set
+## Documentation
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md): component structure, control flow, and design boundaries.
-- [docs/OPERATIONS.md](./docs/OPERATIONS.md): installation, commands, outputs, and runtime expectations.
-- [docs/TOOL_REFERENCE.md](./docs/TOOL_REFERENCE.md): worker tools and their contracts.
-- [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md): extension points, coding map, and verification workflow.
+- [ARCHITECTURE.md](./ARCHITECTURE.md)
+- [docs/OPERATIONS.md](./docs/OPERATIONS.md)
+- [docs/TOOL_REFERENCE.md](./docs/TOOL_REFERENCE.md)
+- [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)
+- [docs/GIT_SPLIT.md](./docs/GIT_SPLIT.md)
 
 ## Verification
 
 ```bash
 cargo fmt
 cargo check
+cargo test
 ```
 
-If `OPENROUTER_API_KEY` is missing, the program still runs, though in mock mode. This is not fraud. It is simply the difference between a laboratory and a field deployment.
+## Legal And Moral Clarity
 
-## Legal and Operational Reality
-
-Use this system only against targets you are authorized to assess. Tools do not confer permission. They merely accelerate consequences.
+Use this only against targets you are authorised to assess. A fast tool does not become an ethical tool by the simple expedient of being well-written.
