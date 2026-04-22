@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chromiumoxide::Page;
@@ -43,6 +44,11 @@ pub struct ReadOnlyBrowserFallback {
     client: Client,
     active_page: Arc<Mutex<Option<FallbackPageSnapshot>>>,
 }
+
+const BROWSER_SESSION_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24);
+const BROWSER_SESSION_MAX_COUNT: usize = 16;
+const BROWSER_SESSION_EVICTION_GRACE_PERIOD: Duration = Duration::from_secs(60 * 30);
+static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct BrowserLaunchContext {
     executable: PathBuf,
@@ -502,12 +508,11 @@ impl ReadOnlyBrowserFallback {
 
 impl BrowserLaunchContext {
     fn discover() -> Result<Self, String> {
-        let home_dir = std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        let home_dir = Self::discover_home_dir();
         let executable = resolve_browser_executable(home_dir.as_deref())?;
         let base_dir = std::env::temp_dir().join("serpantoxide-browser");
         std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+        cleanup_stale_browser_sessions(&base_dir);
 
         let session_root = browser_session_root(&base_dir, std::process::id(), &unique_suffix());
         let user_data_dir = session_root.join("profile");
@@ -520,6 +525,33 @@ impl BrowserLaunchContext {
             user_data_dir,
             temp_dir,
         })
+    }
+
+    fn discover_home_dir() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+
+        #[cfg(windows)]
+        {
+            home.or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| {
+                let home_drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+                let home_path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+                let mut path = PathBuf::from(home_drive);
+                path.push(home_path);
+                Some(path)
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            home
+        }
     }
 
     fn build_config(&self) -> Result<BrowserConfig, String> {
@@ -547,11 +579,16 @@ impl BrowserLaunchContext {
 }
 
 fn unique_suffix() -> String {
-    SystemTime::now()
+    let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        .to_string()
+        .unwrap_or_default();
+    let counter = UNIQUE_SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}",
+        duration.as_secs(),
+        duration.subsec_nanos(),
+        counter
+    )
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -660,33 +697,49 @@ fn standard_browser_locations(home_dir: Option<&Path>) -> Vec<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
+        let program_files = PathBuf::from(r"C:\Program Files");
+        let program_files_x86 = PathBuf::from(r"C:\Program Files (x86)");
+        let windows_paths = [
+            program_files
+                .join("Google")
+                .join("Chrome")
+                .join("Application")
+                .join("chrome.exe"),
+            program_files_x86
+                .join("Google")
+                .join("Chrome")
+                .join("Application")
+                .join("chrome.exe"),
+            program_files
+                .join("Microsoft")
+                .join("Edge")
+                .join("Application")
+                .join("msedge.exe"),
+            program_files_x86
+                .join("Microsoft")
+                .join("Edge")
+                .join("Application")
+                .join("msedge.exe"),
+        ];
+        for path in windows_paths {
+            push_unique_path(&mut candidates, path);
+        }
+
         if let Some(home_dir) = home_dir {
             let local_app_data = home_dir.join("AppData").join("Local");
-            let program_files = PathBuf::from(r"C:\Program Files");
-            let program_files_x86 = PathBuf::from(r"C:\Program Files (x86)");
-            let windows_paths = [
-                program_files
-                    .join("Google")
-                    .join("Chrome")
-                    .join("Application")
-                    .join("chrome.exe"),
-                program_files_x86
-                    .join("Google")
-                    .join("Chrome")
-                    .join("Application")
-                    .join("chrome.exe"),
+            let user_paths = [
                 local_app_data
                     .join("Google")
                     .join("Chrome")
                     .join("Application")
                     .join("chrome.exe"),
-                program_files_x86
+                local_app_data
                     .join("Microsoft")
                     .join("Edge")
                     .join("Application")
                     .join("msedge.exe"),
             ];
-            for path in windows_paths {
+            for path in user_paths {
                 push_unique_path(&mut candidates, path);
             }
         }
@@ -715,7 +768,31 @@ fn browser_binary_names() -> &'static [&'static str] {
 }
 
 fn first_existing_path(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates.into_iter().find(|path| path.exists())
+    candidates
+        .into_iter()
+        .find(|path| is_launchable_browser_path(path))
+}
+
+fn is_launchable_browser_path(path: &Path) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+        mode & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
@@ -726,6 +803,64 @@ fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn browser_session_root(base_dir: &Path, pid: u32, suffix: &str) -> PathBuf {
     base_dir.join(format!("session-{}-{}", pid, suffix))
+}
+
+fn cleanup_stale_browser_sessions(base_dir: &Path) {
+    cleanup_browser_sessions(
+        base_dir,
+        SystemTime::now(),
+        BROWSER_SESSION_MAX_COUNT,
+        BROWSER_SESSION_MAX_AGE,
+        BROWSER_SESSION_EVICTION_GRACE_PERIOD,
+    );
+}
+
+fn cleanup_browser_sessions(
+    base_dir: &Path,
+    now: SystemTime,
+    max_count: usize,
+    max_age: Duration,
+    eviction_grace_period: Duration,
+) {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return;
+    };
+
+    let mut session_dirs = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_browser_session_directory(&path) {
+                return None;
+            }
+
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .or_else(|_| metadata.created())
+                .unwrap_or(UNIX_EPOCH);
+            Some((path, modified))
+        })
+        .collect::<Vec<_>>();
+
+    session_dirs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    for (index, (path, modified)) in session_dirs.into_iter().enumerate() {
+        let age = now.duration_since(modified).unwrap_or_default();
+        let should_remove = age >= max_age || (index >= max_count && age >= eviction_grace_period);
+
+        if should_remove {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn is_browser_session_directory(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("session-"))
 }
 
 fn browser_process_envs(temp_dir: &Path) -> HashMap<String, String> {
@@ -934,6 +1069,14 @@ mod tests {
         std::fs::create_dir_all(&base_dir).unwrap();
         let existing = base_dir.join("chromium");
         std::fs::write(&existing, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&existing).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&existing, permissions).unwrap();
+        }
 
         let resolved = first_existing_path(vec![
             base_dir.join("missing-chrome"),
@@ -947,6 +1090,40 @@ mod tests {
     }
 
     #[test]
+    fn ignores_non_launchable_browser_candidates() {
+        let base_dir =
+            std::env::temp_dir().join(format!("serpantoxide-browser-test-{}", unique_suffix()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let directory = base_dir.join("directory");
+        std::fs::create_dir_all(&directory).unwrap();
+
+        #[cfg(unix)]
+        let non_executable = base_dir.join("chrome");
+        let executable = base_dir.join("chromium");
+        std::fs::write(&executable, b"").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(&non_executable, b"").unwrap();
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+        }
+
+        #[cfg(unix)]
+        let candidates = vec![directory, non_executable, executable.clone()];
+        #[cfg(not(unix))]
+        let candidates = vec![directory, executable.clone()];
+
+        let resolved = first_existing_path(candidates);
+
+        assert_eq!(resolved, Some(executable));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn browser_session_root_scopes_profile_to_unique_run_directory() {
         let base_dir = Path::new("/tmp/serpantoxide-browser");
         let session_root = browser_session_root(base_dir, 42, "abc123");
@@ -955,6 +1132,29 @@ mod tests {
             session_root,
             PathBuf::from("/tmp/serpantoxide-browser/session-42-abc123")
         );
+    }
+
+    #[test]
+    fn cleanup_browser_sessions_removes_expired_session_directories() {
+        let base_dir =
+            std::env::temp_dir().join(format!("serpantoxide-browser-test-{}", unique_suffix()));
+        let session_dir = browser_session_root(&base_dir, 42, "expired");
+        let keep_dir = base_dir.join("keep-me");
+
+        std::fs::create_dir_all(session_dir.join("profile")).unwrap();
+        std::fs::create_dir_all(&keep_dir).unwrap();
+
+        cleanup_browser_sessions(
+            &base_dir,
+            SystemTime::now(),
+            16,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        assert!(!session_dir.exists());
+        assert!(keep_dir.exists());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[cfg(target_os = "macos")]
