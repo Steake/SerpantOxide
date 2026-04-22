@@ -151,7 +151,7 @@ Retains the existing worker, checklist, and crew events while adding:
 ### Phase 4
 
 - Make the GPUI app production-ready enough to consider changing the default macOS behavior.
-- Until then, keep the CLI default on the TUI and launch GPUI explicitly with `--gpui` or through the packaged app bundle.
+- Until then, keep the CLI default on the TUI and launch GPUI explicitly with `--gpui`; the packaged app bundle may default to GPUI for GUI launches, but terminal-attached launches should still preserve TUI access.
 
 ## Test Plan
 

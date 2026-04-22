@@ -6,8 +6,12 @@ use std::path::PathBuf;
 pub struct AppConfig {
     #[serde(default = "default_selected_model")]
     pub selected_model: String,
+    #[serde(default = "default_selected_preset")]
+    pub selected_preset: String,
     #[serde(default = "default_last_target")]
     pub last_target: String,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
 }
 
 fn default_selected_model() -> String {
@@ -18,11 +22,21 @@ fn default_last_target() -> String {
     "None".to_string()
 }
 
+fn default_selected_preset() -> String {
+    crate::mission::default_preset_id().to_string()
+}
+
+fn default_max_iterations() -> usize {
+    16
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             selected_model: default_selected_model(),
+            selected_preset: default_selected_preset(),
             last_target: default_last_target(),
+            max_iterations: default_max_iterations(),
         }
     }
 }
@@ -66,10 +80,7 @@ fn runtime_home_dir() -> PathBuf {
     }
 
     if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(contents_dir) = exe_path
-            .parent()
-            .and_then(|macos_dir| macos_dir.parent())
-        {
+        if let Some(contents_dir) = exe_path.parent().and_then(|macos_dir| macos_dir.parent()) {
             let bundled_runtime = contents_dir.join("Resources").join("runtime");
             if bundled_runtime.exists() {
                 return bundled_runtime;

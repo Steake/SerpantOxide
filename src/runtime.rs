@@ -1,5 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::json;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 use crate::browser::NativeBrowserEngine;
@@ -7,6 +10,7 @@ use crate::config::AppConfig;
 use crate::events::UiEvent;
 use crate::graph::{ShadowGraph, TopologySnapshot};
 use crate::llm::{LlmTelemetrySnapshot, NativeLLMEngine};
+use crate::mission::{self, DiscoverySignals};
 use crate::notes::NotesEngine;
 use crate::orchestrator::Orchestrator;
 use crate::pool::{ToolRecord, WorkerInfo, WorkerPool};
@@ -17,14 +21,19 @@ use crate::web_search::NativeWebSearch;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum RuntimeCommand {
     SetTarget { target: String },
+    SetPreset { preset_id: String },
+    ShowPresets,
     RunAgent { task: String },
     RunCrew { task: String },
     GenerateReport,
     SelectModel { model_id: String },
     OpenNotes { category: Option<String> },
+    StoreKnowledge { category: String, content: String },
     CancelWorker { worker_id: String },
     RetryWorker { worker_id: String },
     ShowPromptPreview,
+    ShowConfig,
+    SetConfig { key: String, value: String },
     ShowTopology,
     ShowMemory,
     ShowTools,
@@ -65,6 +74,7 @@ pub struct RuntimeNoteCategory {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct RuntimeSnapshot {
     pub target: String,
+    pub preset: String,
     pub llm: LlmTelemetrySnapshot,
     pub completed_checklist: Vec<String>,
     pub remaining_checklist: Vec<String>,
@@ -100,30 +110,56 @@ pub struct RuntimeService {
     notes_engine: Arc<NotesEngine>,
     graph: Arc<RwLock<ShadowGraph>>,
     target_shared: Arc<RwLock<String>>,
+    preset_shared: Arc<RwLock<String>>,
     worker_pool: WorkerPool,
 }
 
 impl RuntimeService {
     pub async fn launch() -> Result<Self, String> {
+        crate::startup_trace::log("runtime", "launch start");
         let (raw_event_tx, raw_event_rx) = mpsc::channel::<UiEvent>(1000);
         let (events_tx, _) = broadcast::channel::<UiEvent>(2048);
         let (command_tx, command_rx) = mpsc::channel::<RuntimeCommand>(256);
         let ui_state = Arc::new(RwLock::new(RuntimeUiState::default()));
 
         let persisted_config = AppConfig::load();
+        crate::startup_trace::log(
+            "runtime",
+            format!(
+                "config loaded: model={}, preset={}, target={}",
+                persisted_config.selected_model,
+                persisted_config.selected_preset,
+                persisted_config.last_target
+            ),
+        );
         let graph = Arc::new(RwLock::new(ShadowGraph::new()));
         let target_shared = Arc::new(RwLock::new(persisted_config.last_target));
+        let preset_shared = Arc::new(RwLock::new(persisted_config.selected_preset));
 
+        crate::startup_trace::log("runtime", "launching notes engine");
         let notes_engine = Arc::new(NotesEngine::launch().await?);
+        crate::startup_trace::log("runtime", "notes engine ready");
+        crate::startup_trace::log("runtime", "launching llm engine");
         let llm_engine = Arc::new(NativeLLMEngine::launch().await?);
+        crate::startup_trace::log("runtime", "llm engine ready");
 
         let _ = raw_event_tx
             .send(UiEvent::log("=== Serpantoxide Engine ==="))
             .await;
 
-        let browser_engine = match NativeBrowserEngine::launch().await {
-            Ok(engine) => {
+        crate::startup_trace::log("runtime", "launching browser engine");
+        let browser_engine = match tokio::time::timeout(
+            Duration::from_secs(5),
+            NativeBrowserEngine::launch(),
+        )
+        .await
+        {
+            Ok(Ok(engine)) => {
                 let launch_summary = engine.launch_summary().to_string();
+                crate::startup_trace::log(
+                    "runtime",
+                    format!("browser engine ready: {}", launch_summary),
+                );
                 let _ = raw_event_tx
                     .send(UiEvent::log(
                         "Booting Chromiumoxide Native Engine over CDP...",
@@ -137,7 +173,11 @@ impl RuntimeService {
                     .await;
                 Some(Arc::new(engine))
             }
-            Err(error) => {
+            Ok(Err(error)) => {
+                crate::startup_trace::log_error(
+                    "runtime",
+                    format!("browser engine failed: {}", error),
+                );
                 let _ = raw_event_tx
                     .send(UiEvent::log(format!(
                         "[Native Browser Engine Error] {}. Read-only browser fallback remains available for navigate/get_content/get_links/get_forms.",
@@ -146,10 +186,30 @@ impl RuntimeService {
                     .await;
                 None
             }
+            Err(_) => {
+                crate::startup_trace::log_error("runtime", "browser engine timed out after 5s");
+                let _ = raw_event_tx
+                    .send(UiEvent::log(
+                        "[Native Browser Engine Error] Startup timed out after 5s. Read-only browser fallback remains available for navigate/get_content/get_links/get_forms.",
+                    ))
+                    .await;
+                None
+            }
         };
 
         let search_key =
             std::env::var("TAVILY_API_KEY").unwrap_or_else(|_| "MOCK_SEARCH_KEY".to_string());
+        crate::startup_trace::log(
+            "runtime",
+            format!(
+                "search engine mode: {}",
+                if search_key == "MOCK_SEARCH_KEY" {
+                    "mock"
+                } else {
+                    "live"
+                }
+            ),
+        );
         let search_engine = Arc::new(NativeWebSearch::new(&search_key));
         let worker_pool = WorkerPool::new(
             raw_event_tx.clone(),
@@ -167,8 +227,10 @@ impl RuntimeService {
             search_engine,
             graph.clone(),
             target_shared.clone(),
+            preset_shared.clone(),
             raw_event_tx.clone(),
         );
+        crate::startup_trace::log("runtime", "worker pool and orchestrator ready");
 
         tokio::spawn(run_event_pump(
             raw_event_rx,
@@ -178,6 +240,7 @@ impl RuntimeService {
             notes_engine.clone(),
             graph.clone(),
         ));
+        crate::startup_trace::log("runtime", "event pump spawned");
 
         tokio::spawn(run_command_loop(
             command_rx,
@@ -186,10 +249,13 @@ impl RuntimeService {
             notes_engine.clone(),
             graph.clone(),
             target_shared.clone(),
+            preset_shared.clone(),
             worker_pool.clone(),
             orchestrator,
         ));
+        crate::startup_trace::log("runtime", "command loop spawned");
 
+        crate::startup_trace::log("runtime", "emitting initial state");
         emit_initial_state(
             &raw_event_tx,
             &llm_engine,
@@ -198,12 +264,14 @@ impl RuntimeService {
             &target_shared,
         )
         .await;
+        crate::startup_trace::log("runtime", "initial state emitted");
 
         let _ = raw_event_tx
             .send(UiEvent::log(
                 "=== Initialization Complete. Awaiting Commands... ===",
             ))
             .await;
+        crate::startup_trace::log("runtime", "launch complete");
 
         Ok(Self {
             command_tx,
@@ -213,6 +281,7 @@ impl RuntimeService {
             notes_engine,
             graph,
             target_shared,
+            preset_shared,
             worker_pool,
         })
     }
@@ -237,6 +306,7 @@ impl RuntimeService {
     pub async fn snapshot(&self) -> RuntimeSnapshot {
         let ui_state = self.ui_state.read().await.clone();
         let target = self.target_shared.read().await.clone();
+        let preset = self.preset_shared.read().await.clone();
         let llm = self.llm_engine.telemetry_snapshot().await;
         let workers = self
             .worker_pool
@@ -256,6 +326,7 @@ impl RuntimeService {
 
         RuntimeSnapshot {
             target,
+            preset,
             llm,
             completed_checklist: ui_state.completed_checklist,
             remaining_checklist: ui_state.remaining_checklist,
@@ -397,6 +468,7 @@ async fn run_command_loop(
     notes_engine: Arc<NotesEngine>,
     graph: Arc<RwLock<ShadowGraph>>,
     target_shared: Arc<RwLock<String>>,
+    preset_shared: Arc<RwLock<String>>,
     worker_pool: WorkerPool,
     orchestrator: Orchestrator,
 ) {
@@ -408,6 +480,7 @@ async fn run_command_loop(
             &notes_engine,
             &graph,
             &target_shared,
+            &preset_shared,
             &worker_pool,
             &orchestrator,
         )
@@ -425,6 +498,7 @@ async fn handle_command(
     notes_engine: &Arc<NotesEngine>,
     graph: &Arc<RwLock<ShadowGraph>>,
     target_shared: &Arc<RwLock<String>>,
+    preset_shared: &Arc<RwLock<String>>,
     worker_pool: &WorkerPool,
     orchestrator: &Orchestrator,
 ) -> Result<(), String> {
@@ -449,16 +523,51 @@ async fn handle_command(
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        RuntimeCommand::SetPreset { preset_id } => {
+            let preset_id = mission::normalize_preset_id(&preset_id).ok_or_else(|| {
+                format!(
+                    "Unknown preset '{}'. Use /presets to list options.",
+                    preset_id
+                )
+            })?;
+            {
+                let mut shared = preset_shared.write().await;
+                *shared = preset_id.clone();
+            }
+            let mut config = AppConfig::load();
+            config.selected_preset = preset_id.clone();
+            config.save()?;
+            raw_event_tx
+                .send(UiEvent::log(format!(
+                    "Mission preset set to: {}",
+                    preset_id
+                )))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        RuntimeCommand::ShowPresets => {
+            let current = preset_shared.read().await.clone();
+            for line in mission::preset_catalog_lines(&current) {
+                raw_event_tx
+                    .send(UiEvent::log(line))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         RuntimeCommand::RunAgent { task } => {
             let target = target_shared.read().await.clone();
-            let effective_task = if !target.trim().is_empty()
-                && target != "None"
-                && !task.to_lowercase().contains(&target.to_lowercase())
-            {
-                format!("Active target: {}\nObjective: {}", target, task)
-            } else {
-                task.clone()
-            };
+            let selected_preset = preset_shared.read().await.clone();
+            let signals = current_discovery_signals(graph, notes_engine).await;
+            let mission_profile =
+                mission::resolve_mission(&selected_preset, &target, &task, &signals);
+            let effective_task = mission_profile.execution_brief(&target);
+            raw_event_tx
+                .send(UiEvent::log(format!(
+                    "Agent mission: {}",
+                    mission_profile.runtime_summary()
+                )))
+                .await
+                .map_err(|error| error.to_string())?;
             let worker_id = worker_pool.spawn(effective_task, 1, Vec::new()).await;
             raw_event_tx
                 .send(UiEvent::log(format!(
@@ -470,6 +579,24 @@ async fn handle_command(
         }
         RuntimeCommand::RunCrew { task } => {
             let target = target_shared.read().await.clone();
+            let selected_preset = preset_shared.read().await.clone();
+            let signals = current_discovery_signals(graph, notes_engine).await;
+            let mission_profile =
+                mission::resolve_mission(&selected_preset, &target, &task, &signals);
+            raw_event_tx
+                .send(UiEvent::Checklist {
+                    completed: Vec::new(),
+                    remaining: Vec::new(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            raw_event_tx
+                .send(UiEvent::log(format!(
+                    "Crew mission: {}",
+                    mission_profile.runtime_summary()
+                )))
+                .await
+                .map_err(|error| error.to_string())?;
             let orch = orchestrator.clone();
             let tx = raw_event_tx.clone();
             tokio::spawn(async move {
@@ -543,6 +670,45 @@ async fn handle_command(
                 }
             }
         }
+        RuntimeCommand::StoreKnowledge { category, content } => {
+            let category = category.trim().to_string();
+            if category.is_empty() {
+                return Err("Usage: /store <category> <content>".to_string());
+            }
+            let key = generated_note_key(&category);
+            let target = {
+                let target = target_shared.read().await.clone();
+                if target.trim().is_empty() || target == "None" {
+                    None
+                } else {
+                    Some(target)
+                }
+            };
+            notes_engine
+                .upsert_note(
+                    &key,
+                    &category,
+                    &content,
+                    target,
+                    json!({
+                        "source": "operator_store_command",
+                    }),
+                )
+                .await?;
+            raw_event_tx
+                .send(UiEvent::NotesUpdated {
+                    categories: notes_engine.list_categories().await,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            raw_event_tx
+                .send(UiEvent::log(format!(
+                    "Stored knowledge note [{}] as {}",
+                    category, key
+                )))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         RuntimeCommand::CancelWorker { worker_id } => {
             let cancelled = worker_pool.cancel(&worker_id).await;
             let message = if cancelled {
@@ -587,6 +753,49 @@ async fn handle_command(
                     .map_err(|error| error.to_string())?;
             }
         }
+        RuntimeCommand::ShowConfig => {
+            let config = AppConfig::load();
+            for line in [
+                "--- Runtime Config ---".to_string(),
+                format!("selected_model: {}", config.selected_model),
+                format!("selected_preset: {}", config.selected_preset),
+                format!("last_target: {}", config.last_target),
+                format!("max_iterations: {}", config.max_iterations),
+                "Editable keys: max_iterations".to_string(),
+                "Usage: /config set max_iterations <number>".to_string(),
+            ] {
+                raw_event_tx
+                    .send(UiEvent::log(line))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        RuntimeCommand::SetConfig { key, value } => match key.as_str() {
+            "max_iterations" => {
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| "max_iterations must be a positive integer".to_string())?;
+                if !(1..=128).contains(&parsed) {
+                    return Err("max_iterations must be between 1 and 128".to_string());
+                }
+                let mut config = AppConfig::load();
+                config.max_iterations = parsed;
+                config.save()?;
+                raw_event_tx
+                    .send(UiEvent::log(format!(
+                        "Config updated: max_iterations={}",
+                        parsed
+                    )))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            other => {
+                return Err(format!(
+                    "Unknown config key '{}'. Editable keys: max_iterations",
+                    other
+                ));
+            }
+        },
         RuntimeCommand::ShowTopology => {
             let topology = graph.read().await.to_ascii_topology(120, 40);
             raw_event_tx
@@ -670,6 +879,28 @@ pub fn parse_slash_command(input: &str) -> Result<RuntimeCommand, String> {
         "/quit" | "/exit" | "/q" => Ok(RuntimeCommand::Shutdown),
         "/help" | "/h" | "/?" => Ok(RuntimeCommand::ShowHelp),
         "/modes" => Ok(RuntimeCommand::ShowModes),
+        "/config" => {
+            if parts.len() == 1 {
+                Ok(RuntimeCommand::ShowConfig)
+            } else if parts.len() >= 4 && parts[1] == "set" {
+                Ok(RuntimeCommand::SetConfig {
+                    key: parts[2].to_string(),
+                    value: parts[3..].join(" "),
+                })
+            } else {
+                Err("Usage: /config OR /config set max_iterations <number>".to_string())
+            }
+        }
+        "/preset" => {
+            if parts.len() <= 1 {
+                Ok(RuntimeCommand::ShowPresets)
+            } else {
+                Ok(RuntimeCommand::SetPreset {
+                    preset_id: parts[1..].join(" "),
+                })
+            }
+        }
+        "/presets" => Ok(RuntimeCommand::ShowPresets),
         "/tools" => Ok(RuntimeCommand::ShowTools),
         "/target" => {
             if parts.len() <= 1 {
@@ -683,6 +914,16 @@ pub fn parse_slash_command(input: &str) -> Result<RuntimeCommand, String> {
         "/notes" | "/nodes" => Ok(RuntimeCommand::OpenNotes {
             category: parts.get(1).map(|value| value.to_string()),
         }),
+        "/store" | "/kb" => {
+            if parts.len() <= 2 {
+                Err("Usage: /store <category> <content>".to_string())
+            } else {
+                Ok(RuntimeCommand::StoreKnowledge {
+                    category: parts[1].to_string(),
+                    content: parts[2..].join(" "),
+                })
+            }
+        }
         "/cancel" => {
             if parts.len() <= 1 {
                 Err("Usage: /cancel <worker-id>".to_string())
@@ -741,6 +982,39 @@ pub fn parse_operator_input(input: &str) -> Result<RuntimeCommand, String> {
     }
 }
 
+async fn current_discovery_signals(
+    graph: &Arc<RwLock<ShadowGraph>>,
+    notes_engine: &Arc<NotesEngine>,
+) -> DiscoverySignals {
+    let topology = graph.read().await.snapshot();
+    let note_categories = notes_engine.list_categories().await;
+    DiscoverySignals::new(topology, note_categories)
+}
+
+fn generated_note_key(category: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let category_slug = category
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if category_slug.is_empty() {
+        format!("note_{}", timestamp)
+    } else {
+        format!("{}_{}", category_slug, timestamp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +1061,53 @@ mod tests {
             command,
             RuntimeCommand::RunCrew {
                 task: "Full autonomous assessment".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_show_presets_command() {
+        let command = parse_slash_command("/preset").unwrap();
+        assert_eq!(command, RuntimeCommand::ShowPresets);
+    }
+
+    #[test]
+    fn parses_store_command() {
+        let command = parse_slash_command("/store finding admin panel exposed").unwrap();
+        assert_eq!(
+            command,
+            RuntimeCommand::StoreKnowledge {
+                category: "finding".to_string(),
+                content: "admin panel exposed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_show_config_command() {
+        let command = parse_slash_command("/config").unwrap();
+        assert_eq!(command, RuntimeCommand::ShowConfig);
+    }
+
+    #[test]
+    fn parses_set_config_command() {
+        let command = parse_slash_command("/config set max_iterations 24").unwrap();
+        assert_eq!(
+            command,
+            RuntimeCommand::SetConfig {
+                key: "max_iterations".to_string(),
+                value: "24".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_set_preset_command() {
+        let command = parse_slash_command("/preset web").unwrap();
+        assert_eq!(
+            command,
+            RuntimeCommand::SetPreset {
+                preset_id: "web".to_string()
             }
         );
     }

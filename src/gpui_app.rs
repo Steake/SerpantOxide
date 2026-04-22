@@ -10,7 +10,10 @@ mod macos {
 
     use crate::runtime::{RuntimeCommand, RuntimeService, RuntimeSnapshot};
 
-    pub fn run(runtime: RuntimeService, tokio_handle: tokio::runtime::Handle) -> Result<(), String> {
+    pub fn run(
+        runtime: RuntimeService,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Result<(), String> {
         let snapshot_store = Arc::new(Mutex::new(tokio_handle.block_on(runtime.snapshot())));
         let runtime_for_updates = runtime.clone();
         let snapshot_updater = snapshot_store.clone();
@@ -29,29 +32,26 @@ mod macos {
             let runtime = runtime.clone();
             let handle = tokio_handle.clone();
             let snapshot_store = snapshot_store.clone();
-            cx.open_window(
-                WindowOptions::default(),
-                move |window, cx| {
-                    let view: Entity<MacFrontend> = cx.new(|_| MacFrontend {
-                        active_section: AppSection::Mission,
-                        runtime: runtime.clone(),
-                        tokio_handle: handle.clone(),
-                        snapshot: snapshot_store.clone(),
-                    });
-                    let entity_id = view.entity_id();
-                    window
-                        .spawn(cx, async move |cx| {
-                            loop {
-                                Timer::after(Duration::from_millis(350)).await;
-                                if cx.update(|_, cx| cx.notify(entity_id)).is_err() {
-                                    break;
-                                }
+            cx.open_window(WindowOptions::default(), move |window, cx| {
+                let view: Entity<MacFrontend> = cx.new(|_| MacFrontend {
+                    active_section: AppSection::Mission,
+                    runtime: runtime.clone(),
+                    tokio_handle: handle.clone(),
+                    snapshot: snapshot_store.clone(),
+                });
+                let entity_id = view.entity_id();
+                window
+                    .spawn(cx, async move |cx| {
+                        loop {
+                            Timer::after(Duration::from_millis(350)).await;
+                            if cx.update(|_, cx| cx.notify(entity_id)).is_err() {
+                                break;
                             }
-                        })
-                        .detach();
-                    view
-                },
-            )
+                        }
+                    })
+                    .detach();
+                view
+            })
             .map_err(|error| error.to_string())
             .unwrap();
         });
@@ -177,7 +177,14 @@ mod macos {
                         .topology
                         .relationships
                         .iter()
-                        .map(|edge| format!("{} -> {} ({})", edge.source, edge.target, edge.reasons.join(", ")))
+                        .map(|edge| {
+                            format!(
+                                "{} -> {} ({})",
+                                edge.source,
+                                edge.target,
+                                edge.reasons.join(", ")
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join("\n")
                 }
@@ -201,8 +208,9 @@ mod macos {
                 .unwrap_or_else(|| "No report or crew summary yet.".to_string());
 
             let settings = format!(
-                "Target: {}\nModel: {}\nStatus: {}\nAvailable models: {}\nShutdown requested: {}",
+                "Target: {}\nPreset: {}\nModel: {}\nStatus: {}\nAvailable models: {}\nShutdown requested: {}",
                 snapshot.target,
+                snapshot.preset,
                 snapshot.llm.model,
                 snapshot.llm.status,
                 snapshot.llm.available_models.len(),

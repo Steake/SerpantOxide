@@ -54,6 +54,16 @@ pub struct NativeLLMEngine {
     pub state: Arc<RwLock<LLMState>>,
 }
 
+impl Clone for NativeLLMEngine {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            api_key: self.api_key.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LlmTelemetrySnapshot {
     pub model: String,
@@ -67,20 +77,40 @@ pub struct LlmTelemetrySnapshot {
 
 impl NativeLLMEngine {
     pub async fn launch() -> Result<Self, String> {
+        crate::startup_trace::log("llm", "launch start");
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| e.to_string())?;
 
         let config = crate::config::AppConfig::load();
+        let api_key =
+            std::env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| "MOCK_KEY".to_string());
+        let initial_status = if api_key == "MOCK_KEY" {
+            "Loading mock model catalog..."
+        } else {
+            "Loading OpenRouter models..."
+        };
+        crate::startup_trace::log(
+            "llm",
+            format!(
+                "launch mode: {}, model={}",
+                if api_key == "MOCK_KEY" {
+                    "mock"
+                } else {
+                    "openrouter"
+                },
+                config.selected_model
+            ),
+        );
 
         let engine = NativeLLMEngine {
             client: Arc::new(client),
-            api_key: std::env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| "MOCK_KEY".to_string()),
+            api_key,
             state: Arc::new(RwLock::new(LLMState {
                 model: config.selected_model,
                 is_thinking: false,
-                status: "Idle".to_string(),
+                status: initial_status.to_string(),
                 last_latency_ms: 0,
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -88,14 +118,21 @@ impl NativeLLMEngine {
             })),
         };
 
-        // Trigger initial model fetch
-        let _ = engine.refresh_models().await;
+        // Fetch the model catalog in the background so the TUI can start immediately.
+        let refresh_engine = engine.clone();
+        tokio::spawn(async move {
+            crate::startup_trace::log("llm", "background model refresh start");
+            let _ = refresh_engine.refresh_models().await;
+            crate::startup_trace::log("llm", "background model refresh finished");
+        });
 
+        crate::startup_trace::log("llm", "launch complete");
         Ok(engine)
     }
 
     pub async fn refresh_models(&self) -> Result<(), String> {
         if self.api_key == "MOCK_KEY" {
+            crate::startup_trace::log("llm", "refresh_models using mock catalog");
             let mut s = self.state.write().await;
             s.available_models = vec![
                 OpenRouterModel {
@@ -123,9 +160,13 @@ impl NativeLLMEngine {
                     }),
                 },
             ];
+            s.status = "Ready (mock mode)".to_string();
+            s.is_thinking = false;
+            crate::startup_trace::log("llm", "mock catalog loaded");
             return Ok(());
         }
 
+        crate::startup_trace::log("llm", "refresh_models requesting OpenRouter models");
         let res = match self
             .client
             .get("https://openrouter.ai/api/v1/models")
@@ -135,36 +176,70 @@ impl NativeLLMEngine {
             Ok(res) => res,
             Err(e) => {
                 let message = format!("Model list fetch failed: {}", e);
+                crate::startup_trace::log_error("llm", &message);
                 self.set_status_message(message.clone()).await;
                 return Err(message);
             }
         };
+        crate::startup_trace::log(
+            "llm",
+            format!("OpenRouter models response status: {}", res.status()),
+        );
         if res.status().is_success() {
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
             if let Some(models) = data["data"].as_array() {
                 let mut parsed = Vec::new();
                 for m in models {
-                    if let (Some(id), Some(name)) = (m["id"].as_str(), m["name"].as_str()) {
-                        parsed.push(OpenRouterModel {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            pricing: Some(Pricing {
-                                prompt: m["pricing"]["prompt"].as_str().unwrap_or("0").to_string(),
-                                completion: m["pricing"]["completion"]
-                                    .as_str()
-                                    .unwrap_or("0")
-                                    .to_string(),
-                            }),
-                        });
-                    }
+                    let id = match &m["id"] {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => continue,
+                    };
+                    let name = match &m["name"] {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => id.clone(),
+                    };
+
+                    let prompt_price = match &m["pricing"]["prompt"] {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => "0".to_string(),
+                    };
+                    let completion_price = match &m["pricing"]["completion"] {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => "0".to_string(),
+                    };
+
+                    parsed.push(OpenRouterModel {
+                        id,
+                        name,
+                        pricing: Some(Pricing {
+                            prompt: prompt_price,
+                            completion: completion_price,
+                        }),
+                    });
                 }
-                let mut s = self.state.write().await;
-                s.available_models = parsed;
+                let count = parsed.len();
+                {
+                    let mut s = self.state.write().await;
+                    s.available_models = parsed;
+                }
+                crate::startup_trace::log("llm", format!("loaded {} OpenRouter models", count));
+                self.set_status_message(format!("Loaded {} models from OpenRouter", count))
+                    .await;
+            } else {
+                crate::startup_trace::log_error(
+                    "llm",
+                    "OpenRouter returned unexpected data format",
+                );
+                self.set_status_message("OpenRouter returned unexpected data format".to_string())
+                    .await;
             }
         } else {
             let status = res.status();
             let err_body = res.text().await.unwrap_or_default();
             let message = summarize_provider_error(status.as_u16(), &err_body);
+            crate::startup_trace::log_error("llm", format!("model list error: {}", message));
             self.set_status_message(format!("Model list error: {}", message))
                 .await;
             return Err(message);
@@ -342,29 +417,47 @@ impl NativeLLMEngine {
                 {
                     "role": "system",
                     "content": format!(
-                        "You complete operator input for a pentest terminal.\n\
+                        "You complete operator input for the Serpantoxide operator terminal.\n\
                          Existing input: {:?}\n\
                          Context: {}\n\n\
                          Return ONLY the exact characters to append next.\n\
+                         Prefer completions that match normal Serpantoxide operator patterns.\n\
+                         Common patterns:\n\
+                         - /target <host>\n\
+                         - /crew <objective>\n\
+                         - /preset <name>\n\
+                         - /store <category> <finding>\n\
+                         - /config set max_iterations <number>\n\
+                         - NMAP: <host>\n\
+                         - BROWSER: http://<target>\n\
+                         - SEARCH: <query>\n\
+                         - EVM: <action>\n\
                          Rules:\n\
                          - do not repeat or paraphrase the existing input\n\
                          - do not explain anything\n\
                          - do not include quotes, markdown, labels, or newlines\n\
+                         - prefer concise, realistic operator text over generic prose\n\
                          - if unsure, return an empty string\n\
-                         - maximum 18 characters",
+                         - maximum 48 characters",
                         partial_input,
                         context
                     )
                 }
             ],
-            "max_tokens": 12,
+            "max_tokens": 24,
             "temperature": 0.0
         });
 
         if self.api_key == "MOCK_KEY" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            if partial_input == "/sc" {
-                return Ok("an".to_string());
+            match partial_input {
+                "/sc" => return Ok("an".to_string()),
+                "/con" => return Ok("fig".to_string()),
+                "/config" => return Ok(" set max_iterations 24".to_string()),
+                "/st" => return Ok("ore ".to_string()),
+                "NMA" => return Ok("P: ".to_string()),
+                "BROW" => return Ok("SER: http://".to_string()),
+                _ => {}
             }
             return Ok("".to_string());
         }
@@ -597,27 +690,23 @@ impl NativeLLMEngine {
                         }),
                     },
                     ToolCall {
-                        id: "mock-spawn-1".to_string(),
-                        name: "spawn_agent".to_string(),
+                        id: "mock-spawn-batch".to_string(),
+                        name: "spawn_parallel_agents".to_string(),
                         arguments: json!({
-                            "task": format!("NMAP: {}", target),
-                            "priority": 3
-                        }),
-                    },
-                    ToolCall {
-                        id: "mock-spawn-2".to_string(),
-                        name: "spawn_agent".to_string(),
-                        arguments: json!({
-                            "task": format!("SEARCH: known attack surface and vulnerabilities for {}", target),
-                            "priority": 2
-                        }),
-                    },
-                    ToolCall {
-                        id: "mock-spawn-3".to_string(),
-                        name: "spawn_agent".to_string(),
-                        arguments: json!({
-                            "task": format!("BROWSER: http://{}", target),
-                            "priority": 2
+                            "agents": [
+                                {
+                                    "task": format!("NMAP: {}", target),
+                                    "priority": 3
+                                },
+                                {
+                                    "task": format!("SEARCH: known attack surface and vulnerabilities for {}", target),
+                                    "priority": 2
+                                },
+                                {
+                                    "task": format!("BROWSER: http://{}", target),
+                                    "priority": 2
+                                }
+                            ]
                         }),
                     },
                     ToolCall {
@@ -672,7 +761,7 @@ fn normalize_completion_suffix(partial_input: &str, raw_output: &str) -> String 
         .lines()
         .next()
         .unwrap_or("")
-        .trim()
+        .trim_end()
         .trim_matches('`')
         .trim_matches('"')
         .trim_matches('\'')
@@ -703,22 +792,44 @@ fn normalize_completion_suffix(partial_input: &str, raw_output: &str) -> String 
     }
 
     if candidate.contains('\n')
-        || candidate.contains(':')
         || candidate.contains('{')
         || candidate.contains('}')
         || candidate.contains('[')
         || candidate.contains(']')
-        || candidate.chars().count() > 24
-        || candidate.split_whitespace().count() > 4
+        || candidate.chars().count() > 48
+        || candidate.split_whitespace().count() > 8
+        || candidate.chars().any(|ch| ch.is_control())
     {
         return String::new();
     }
 
-    if partial_input.starts_with('/') {
-        return String::new();
+    candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_completion_suffix;
+
+    #[test]
+    fn autocomplete_keeps_leading_space_for_command_arguments() {
+        assert_eq!(
+            normalize_completion_suffix("/config", " set max_iterations 24"),
+            " set max_iterations 24"
+        );
     }
 
-    candidate
+    #[test]
+    fn autocomplete_accepts_worker_prefix_suffixes() {
+        assert_eq!(normalize_completion_suffix("NMA", "P: "), "P: ");
+    }
+
+    #[test]
+    fn autocomplete_strips_repeated_prefix_case_insensitively() {
+        assert_eq!(
+            normalize_completion_suffix("/store", "/STORE finding open admin"),
+            " finding open admin"
+        );
+    }
 }
 
 fn summarize_provider_error(status_code: u16, body: &str) -> String {

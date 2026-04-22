@@ -135,7 +135,24 @@ RUNTIME_DIR="${APP_ROOT}/Resources/runtime"
 export SERPANTOXIDE_HOME="${RUNTIME_DIR}"
 cd "${RUNTIME_DIR}"
 
-exec "${APP_ROOT}/MacOS/Serpantoxide-bin" --gpui "$@"
+frontend_args=()
+has_frontend_flag="0"
+for arg in "$@"; do
+  if [[ "${arg}" == "--gpui" || "${arg}" == "--tui" ]]; then
+    has_frontend_flag="1"
+    break
+  fi
+done
+
+if [[ "${has_frontend_flag}" != "1" ]]; then
+  if [[ -t 0 && -t 1 ]]; then
+    frontend_args=(--tui)
+  else
+    frontend_args=(--gpui)
+  fi
+fi
+
+exec "${APP_ROOT}/MacOS/Serpantoxide-bin" "${frontend_args[@]}" "$@"
 EOF
 chmod 755 "${LAUNCHER_PATH}"
 

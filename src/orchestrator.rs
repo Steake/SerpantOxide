@@ -5,9 +5,11 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
 
 use crate::browser::NativeBrowserEngine;
+use crate::config::AppConfig;
 use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
 use crate::llm::{ChatResponse, NativeLLMEngine, ToolCall};
+use crate::mission::{self, DiscoverySignals, MissionProfile};
 use crate::notes::NotesEngine;
 use crate::pool::WorkerPool;
 use crate::prompts;
@@ -22,6 +24,7 @@ pub struct Orchestrator {
     search: Arc<NativeWebSearch>,
     graph: Arc<RwLock<ShadowGraph>>,
     target_shared: Arc<RwLock<String>>,
+    preset_shared: Arc<RwLock<String>>,
     tx: Sender<UiEvent>,
 }
 
@@ -34,6 +37,7 @@ impl Orchestrator {
         search: Arc<NativeWebSearch>,
         graph: Arc<RwLock<ShadowGraph>>,
         target_shared: Arc<RwLock<String>>,
+        preset_shared: Arc<RwLock<String>>,
         tx: Sender<UiEvent>,
     ) -> Self {
         Self {
@@ -44,6 +48,7 @@ impl Orchestrator {
             search,
             graph,
             target_shared,
+            preset_shared,
             tx,
         }
     }
@@ -64,13 +69,19 @@ impl Orchestrator {
             .await;
 
         let mut current_plan: Vec<String> = Vec::new();
+        let initial_mission = self.build_mission_profile(target, task).await;
         let mut messages = vec![json!({
             "role": "user",
-            "content": format!("Target: {}\n\nTask: {}", target, task)
+            "content": initial_mission.execution_brief(target)
         })];
 
-        for iteration in 0..10 {
-            let system_prompt = self.build_system_prompt(target, task, &current_plan).await;
+        let max_iterations = AppConfig::load().max_iterations.max(1);
+
+        for iteration in 0..max_iterations {
+            let mission = self.build_mission_profile(target, task).await;
+            let system_prompt = self
+                .build_system_prompt(target, task, &mission, &current_plan)
+                .await;
             let response = self
                 .llm
                 .generate_with_tools(&system_prompt, messages.clone(), orchestration_tools())
@@ -89,14 +100,50 @@ impl Orchestrator {
             let assistant_message = build_assistant_message(&response);
             messages.push(assistant_message);
 
+            let has_plan_update = response
+                .tool_calls
+                .iter()
+                .any(|call| call.name == "update_plan");
+            if current_plan.is_empty() && !has_plan_update {
+                let _ = self
+                    .tx
+                    .send(UiEvent::log(
+                        "Crew has not published a checklist yet; requesting update_plan before execution."
+                            .to_string(),
+                    ))
+                    .await;
+                messages.push(json!({
+                    "role": "user",
+                    "content": "Before spawning, waiting, cancelling, or finishing, call update_plan with a concise checklist for this crew mission. Then continue with the mission."
+                }));
+                continue;
+            }
+
             if response.tool_calls.is_empty() {
-                if iteration == 0 {
+                if iteration + 1 >= max_iterations {
                     let fallback = self
-                        .finish_task("Crew execution ended without explicit finish.".to_string())
+                        .finish_task(format!(
+                            "Crew iteration budget reached while pursuing: {}",
+                            mission.desired_outcome
+                        ))
                         .await?;
                     self.emit_completion(&fallback).await;
+                    return Ok(());
                 }
-                break;
+
+                let worker_status = self.worker_status_lines().await;
+                let nudge = mission.continuation_nudge(&worker_status);
+                let _ = self
+                    .tx
+                    .send(UiEvent::log(
+                        "Crew returned no tool calls; injecting continuation nudge.".to_string(),
+                    ))
+                    .await;
+                messages.push(json!({
+                    "role": "user",
+                    "content": nudge
+                }));
+                continue;
             }
 
             for tool_call in response.tool_calls {
@@ -152,17 +199,27 @@ impl Orchestrator {
     }
 
     pub async fn prompt_preview(&self, target: &str, task: &str) -> String {
-        self.build_system_prompt(target, task, &[]).await
+        let mission = self.build_mission_profile(target, task).await;
+        self.build_system_prompt(target, task, &mission, &[]).await
+    }
+
+    async fn build_mission_profile(&self, target: &str, task: &str) -> MissionProfile {
+        let selected_preset = self.preset_shared.read().await.clone();
+        let topology = self.graph.read().await.snapshot();
+        let note_categories = self.notes.list_categories().await;
+        let signals = DiscoverySignals::new(topology, note_categories);
+        mission::resolve_mission(&selected_preset, target, task, &signals)
     }
 
     async fn build_system_prompt(
         &self,
         target: &str,
         task: &str,
+        mission: &MissionProfile,
         current_plan: &[String],
     ) -> String {
-        let insights = self.graph.read().await.get_strategic_insights();
         let note_categories = self.notes.list_categories().await;
+        let insights = self.graph.read().await.get_strategic_insights();
         let mut augmented_insights = insights;
         if !note_categories.is_empty() {
             augmented_insights.push(format!(
@@ -185,8 +242,40 @@ impl Orchestrator {
         if !self.search.api_key().is_empty() {
             augmented_insights.push("Web intelligence search is available.".to_string());
         }
+        let worker_status = self.worker_status_lines().await;
 
-        prompts::build_crew_prompt(target, task, &augmented_insights, current_plan)
+        prompts::build_crew_prompt(
+            target,
+            task,
+            mission,
+            &augmented_insights,
+            current_plan,
+            &worker_status,
+        )
+    }
+
+    async fn worker_status_lines(&self) -> Vec<String> {
+        self.pool
+            .get_workers()
+            .await
+            .into_iter()
+            .take(8)
+            .map(|worker| {
+                let outcome = worker
+                    .result
+                    .as_deref()
+                    .or(worker.error.as_deref())
+                    .unwrap_or("");
+                if outcome.is_empty() {
+                    format!("{} [{}] {}", worker.id, worker.status, worker.task)
+                } else {
+                    format!(
+                        "{} [{}] {} -> {}",
+                        worker.id, worker.status, worker.task, outcome
+                    )
+                }
+            })
+            .collect()
     }
 
     async fn execute_tool(
@@ -220,6 +309,44 @@ impl Orchestrator {
                     .unwrap_or_default();
                 let worker_id = self.pool.spawn(task.clone(), priority, depends_on).await;
                 Ok(format!("Spawned {} for {}", worker_id, task))
+            }
+            "spawn_parallel_agents" => {
+                let agents = tool_call.arguments["agents"]
+                    .as_array()
+                    .ok_or_else(|| "spawn_parallel_agents.agents must be an array".to_string())?;
+
+                if agents.is_empty() {
+                    return Err("spawn_parallel_agents.agents cannot be empty".to_string());
+                }
+
+                let mut spawned = Vec::new();
+                for agent in agents {
+                    let task = agent["task"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            "spawn_parallel_agents.agents[].task is required".to_string()
+                        })?
+                        .to_string();
+                    let priority = agent["priority"].as_i64().unwrap_or(1);
+                    let depends_on = agent["depends_on"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    let worker_id = self.pool.spawn(task.clone(), priority, depends_on).await;
+                    spawned.push((worker_id, task));
+                }
+
+                Ok(spawned
+                    .into_iter()
+                    .map(|(worker_id, task)| format!("Spawned {} for {}", worker_id, task))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
             }
             "wait_for_agents" => {
                 let agent_ids = tool_call.arguments["agent_ids"].as_array().map(|items| {
@@ -342,6 +469,28 @@ fn orchestration_tools() -> Vec<serde_json::Value> {
                     "depends_on": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": ["task"]
+            }),
+        ),
+        tool(
+            "spawn_parallel_agents",
+            "Spawn multiple independent workers in one batch. Use this for initial reconnaissance spreads or any time several tasks can run concurrently.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task": {"type": "string"},
+                                "priority": {"type": "integer"},
+                                "depends_on": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["task"]
+                        }
+                    }
+                },
+                "required": ["agents"]
             }),
         ),
         tool(

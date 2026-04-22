@@ -82,6 +82,9 @@ pub async fn run_tui(
     let mut logs: Vec<String> = Vec::new();
     let mut reader = EventStream::new();
     let mut input = String::new();
+    let mut input_history: Vec<String> = Vec::new();
+    let mut history_cursor: Option<usize> = None;
+    let mut history_draft = String::new();
 
     // UI State
     let mut is_nav_mode = false;
@@ -105,6 +108,7 @@ pub async fn run_tui(
     let mut _last_crew_summary: Option<String> = None;
 
     let engine_clone = llm_engine.clone();
+    let suggestion_target = target_shared.clone();
     tokio::spawn(async move {
         let mut last_req = String::new();
         loop {
@@ -126,8 +130,9 @@ pub async fn run_tui(
             }
 
             if !req.is_empty() {
-                let context = "User typing a pentest orchestrator prompt.";
-                if let Ok(suggestion) = engine_clone.ai_suggest_completion(&req, context).await {
+                let active_target = suggestion_target.read().await.clone();
+                let context = autocomplete_context(&req, &active_target);
+                if let Ok(suggestion) = engine_clone.ai_suggest_completion(&req, &context).await {
                     let _ = suggest_resp_tx.send((req.clone(), suggestion)).await;
                 } else {
                     let _ = suggest_resp_tx.send((req.clone(), "".to_string())).await;
@@ -157,6 +162,8 @@ pub async fn run_tui(
     let commands = vec![
         "/agent",
         "/crew",
+        "/preset",
+        "/presets",
         "/se",
         "/evm",
         "/chain",
@@ -164,6 +171,8 @@ pub async fn run_tui(
         "/tools",
         "/notes",
         "/nodes",
+        "/store",
+        "/kb",
         "/cancel",
         "/retry",
         "/report",
@@ -557,9 +566,24 @@ pub async fn run_tui(
                         })
                         .collect();
 
+                    let total_models = filtered_models.len();
+                    let list_height = area.height.saturating_sub(2) as usize;
+
+                    let start_index = if total_models <= list_height {
+                        0
+                    } else {
+                        let mut start = popup_cursor.saturating_sub(list_height / 2);
+                        if start + list_height > total_models {
+                            start = total_models.saturating_sub(list_height);
+                        }
+                        start
+                    };
+
                     let items: Vec<ListItem> = filtered_models
                         .iter()
                         .enumerate()
+                        .skip(start_index)
+                        .take(list_height)
                         .map(|(i, m)| {
                             let style = if i == popup_cursor {
                                 Style::default()
@@ -1028,6 +1052,18 @@ pub async fn run_tui(
                                 } else if is_nav_mode {
                                     if agent_cursor > 0 { agent_cursor -= 1; }
                                     else { telemetry_scroll = telemetry_scroll.saturating_add(1); }
+                                } else if navigate_history_older(
+                                    &mut input,
+                                    &input_history,
+                                    &mut history_cursor,
+                                    &mut history_draft,
+                                ) {
+                                    update_prompt_suggestion(
+                                        &input,
+                                        &commands,
+                                        &mut suggestion_ghost,
+                                        &suggest_tx,
+                                    );
                                 }
                             }
                             KeyCode::Down => {
@@ -1090,6 +1126,18 @@ pub async fn run_tui(
                                         if agent_cursor < p.workers.len().saturating_sub(1) { agent_cursor += 1; }
                                         else { telemetry_scroll = telemetry_scroll.saturating_sub(1); }
                                     }
+                                } else if navigate_history_newer(
+                                    &mut input,
+                                    &input_history,
+                                    &mut history_cursor,
+                                    &mut history_draft,
+                                ) {
+                                    update_prompt_suggestion(
+                                        &input,
+                                        &commands,
+                                        &mut suggestion_ghost,
+                                        &suggest_tx,
+                                    );
                                 }
                             }
                             KeyCode::Char('q') if input.trim().is_empty() && !show_topology_modal && !show_model_popup && active_report.is_none() && selected_agent_id.is_none() => break,
@@ -1100,6 +1148,7 @@ pub async fn run_tui(
                                     }
                                 } else if show_model_popup { popup_query.push(c); popup_cursor = 0; }
                                 else if !is_nav_mode {
+                                    clear_history_navigation(&mut history_cursor, &mut history_draft);
                                     input.push(c);
                                     update_prompt_suggestion(
                                         &input,
@@ -1113,6 +1162,7 @@ pub async fn run_tui(
                                 if show_topology_modal {
                                 } else if show_model_popup { popup_query.pop(); popup_cursor = 0; }
                                 else if !is_nav_mode {
+                                    clear_history_navigation(&mut history_cursor, &mut history_draft);
                                     input.pop();
                                     update_prompt_suggestion(
                                         &input,
@@ -1126,6 +1176,7 @@ pub async fn run_tui(
                                 if show_topology_modal {
                                     topology_focus = next_topology_focus(topology_focus);
                                 } else if !is_nav_mode && !suggestion_ghost.is_empty() {
+                                    clear_history_navigation(&mut history_cursor, &mut history_draft);
                                     input.push_str(&suggestion_ghost);
                                     suggestion_ghost.clear();
                                     update_prompt_suggestion(
@@ -1169,7 +1220,10 @@ pub async fn run_tui(
                                         }
                                     }
                                 } else if !input.is_empty() {
-                                    let clean_input = input.trim().to_lowercase();
+                                    let submitted_input = input.trim().to_string();
+                                    push_input_history(&mut input_history, &submitted_input);
+                                    clear_history_navigation(&mut history_cursor, &mut history_draft);
+                                    let clean_input = submitted_input.to_lowercase();
                                     if clean_input == "/quit" || clean_input == "/exit" || clean_input == "/q" {
                                         let _ = cmd_tx.send(RuntimeCommand::Shutdown).await;
                                         break;
@@ -1189,7 +1243,7 @@ pub async fn run_tui(
                                         is_generating_report = true;
                                         let _ = cmd_tx.send(RuntimeCommand::GenerateReport).await;
                                     } else {
-                                        match parse_operator_input(&input) {
+                                        match parse_operator_input(&submitted_input) {
                                             Ok(command) => {
                                                 let _ = cmd_tx.send(command).await;
                                             }
@@ -1210,6 +1264,7 @@ pub async fn run_tui(
                         } else if !is_nav_mode && !show_topology_modal {
                             let pasted = normalize_pasted_text(&pasted);
                             if !pasted.is_empty() {
+                                clear_history_navigation(&mut history_cursor, &mut history_draft);
                                 input.push_str(&pasted);
                                 update_prompt_suggestion(
                                     &input,
@@ -2171,6 +2226,99 @@ fn update_prompt_suggestion(
     }
 }
 
+fn push_input_history(input_history: &mut Vec<String>, input: &str) {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if input_history
+        .last()
+        .is_some_and(|previous| previous == trimmed)
+    {
+        return;
+    }
+
+    input_history.push(trimmed.to_string());
+    if input_history.len() > 200 {
+        input_history.remove(0);
+    }
+}
+
+fn clear_history_navigation(history_cursor: &mut Option<usize>, history_draft: &mut String) {
+    *history_cursor = None;
+    history_draft.clear();
+}
+
+fn navigate_history_older(
+    input: &mut String,
+    input_history: &[String],
+    history_cursor: &mut Option<usize>,
+    history_draft: &mut String,
+) -> bool {
+    if input_history.is_empty() {
+        return false;
+    }
+
+    match history_cursor {
+        Some(cursor) if *cursor > 0 => *cursor -= 1,
+        Some(_) => {}
+        None => {
+            *history_draft = input.clone();
+            *history_cursor = Some(input_history.len() - 1);
+        }
+    }
+
+    if let Some(cursor) = *history_cursor {
+        *input = input_history[cursor].clone();
+        true
+    } else {
+        false
+    }
+}
+
+fn navigate_history_newer(
+    input: &mut String,
+    input_history: &[String],
+    history_cursor: &mut Option<usize>,
+    history_draft: &mut String,
+) -> bool {
+    let Some(cursor) = *history_cursor else {
+        return false;
+    };
+
+    if cursor + 1 < input_history.len() {
+        *history_cursor = Some(cursor + 1);
+        *input = input_history[cursor + 1].clone();
+    } else {
+        *history_cursor = None;
+        *input = std::mem::take(history_draft);
+    }
+
+    true
+}
+
+fn autocomplete_context(input: &str, active_target: &str) -> String {
+    let target_hint = if active_target.trim().is_empty() || active_target == "None" {
+        "No active target is set.".to_string()
+    } else {
+        format!("Active target: {}.", active_target)
+    };
+
+    let mode_hint = if input.trim_start().starts_with('/') {
+        "Prefer slash-command continuations and realistic command arguments."
+    } else if looks_like_worker_prefix_seed(input) || input.contains(':') {
+        "Prefer Serpantoxide worker prefixes and concrete tool-oriented suffixes."
+    } else {
+        "Prefer concrete operator objectives and concise crew-task wording."
+    };
+
+    format!(
+        "{} {} Favor typical Serpantoxide patterns such as /target <host>, /crew <objective>, /preset <name>, /store <category> <finding>, /config set max_iterations <number>, NMAP: <host>, BROWSER: http://<target>, SEARCH: <query>, and EVM: <action>.",
+        target_hint, mode_hint
+    )
+}
+
 fn normalize_pasted_text(pasted: &str) -> String {
     let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
     normalized.trim_end_matches('\n').to_string()
@@ -2237,22 +2385,30 @@ fn wrapped_line_count(text: &str, width: usize) -> u16 {
 
 fn should_request_ai_completion(input: &str) -> bool {
     let trimmed = input.trim();
-    !trimmed.is_empty()
-        && !trimmed.starts_with('/')
-        && trimmed.chars().count() >= 12
-        && trimmed.contains(' ')
-        && !trimmed.contains('\n')
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return false;
+    }
+
+    if trimmed.starts_with('/') {
+        return trimmed.chars().count() >= 3;
+    }
+
+    if looks_like_worker_prefix_seed(trimmed) {
+        return trimmed.chars().count() >= 3;
+    }
+
+    trimmed.chars().count() >= 8 && (trimmed.contains(' ') || trimmed.contains(':'))
 }
 
 fn is_useful_ghost_text(current_input: &str, suggestion: &str) -> bool {
     let trimmed = suggestion.trim();
-    if trimmed.is_empty() || current_input.trim().starts_with('/') {
+    if trimmed.is_empty() || current_input.trim().is_empty() {
         return false;
     }
 
     if suggestion.contains('\n')
-        || suggestion.chars().count() > 24
-        || suggestion.split_whitespace().count() > 4
+        || suggestion.chars().count() > 48
+        || suggestion.split_whitespace().count() > 8
         || suggestion.contains("Context:")
         || suggestion.contains("Provide ONLY")
         || suggestion.contains("The user's input")
@@ -2260,12 +2416,20 @@ fn is_useful_ghost_text(current_input: &str, suggestion: &str) -> bool {
         || suggestion.contains('}')
         || suggestion.contains('[')
         || suggestion.contains(']')
-        || suggestion.contains(':')
     {
         return false;
     }
 
     suggestion.chars().all(|ch| !ch.is_control())
+}
+
+fn looks_like_worker_prefix_seed(input: &str) -> bool {
+    let trimmed = input.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && !trimmed.contains(' ')
+        && trimmed.chars().count() <= 10
+        && trimmed.chars().all(|ch| ch.is_ascii_uppercase())
 }
 
 fn describe_model_pricing(model: &crate::llm::OpenRouterModel) -> String {
@@ -2279,5 +2443,66 @@ fn describe_model_pricing(model: &crate::llm::OpenRouterModel) -> String {
         }
     } else {
         "[pricing unknown]".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_navigation_restores_draft_after_returning_to_present() {
+        let mut input = "draft".to_string();
+        let history = vec!["/target demo.local".to_string(), "/crew recon".to_string()];
+        let mut cursor = None;
+        let mut draft = String::new();
+
+        assert!(navigate_history_older(
+            &mut input,
+            &history,
+            &mut cursor,
+            &mut draft
+        ));
+        assert_eq!(input, "/crew recon");
+
+        assert!(navigate_history_newer(
+            &mut input,
+            &history,
+            &mut cursor,
+            &mut draft
+        ));
+        assert_eq!(input, "draft");
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn history_push_skips_empty_and_consecutive_duplicates() {
+        let mut history = Vec::new();
+
+        push_input_history(&mut history, "");
+        push_input_history(&mut history, "/crew recon");
+        push_input_history(&mut history, "/crew recon");
+        push_input_history(&mut history, "/store finding admin");
+
+        assert_eq!(
+            history,
+            vec![
+                "/crew recon".to_string(),
+                "/store finding admin".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn slash_and_prefix_inputs_can_request_ai_completion() {
+        assert!(should_request_ai_completion("/con"));
+        assert!(should_request_ai_completion("NMA"));
+        assert!(should_request_ai_completion("/config set"));
+    }
+
+    #[test]
+    fn ghost_text_accepts_worker_prefix_suffixes() {
+        assert!(is_useful_ghost_text("NMA", "P: "));
+        assert!(is_useful_ghost_text("/config", " set max_iterations 24"));
     }
 }

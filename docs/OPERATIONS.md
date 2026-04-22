@@ -45,7 +45,8 @@ scripts/package_macos_app.sh
 scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
 ```
 
-The bundle launcher starts the binary with `--gpui` and stages a bundle-local runtime directory under `Contents/Resources/runtime`.
+The bundle launcher stages a bundle-local runtime directory under `Contents/Resources/runtime`.
+When it is opened as a macOS app it defaults to `--gpui`; when it is invoked from a terminal it defaults to `--tui` unless you pass an explicit frontend flag.
 
 ### 3. Verification
 

@@ -58,12 +58,19 @@ struct BrowserLaunchContext {
 
 impl NativeBrowserEngine {
     pub async fn launch() -> Result<Self, String> {
+        crate::startup_trace::log("browser", "launch start");
         let launch = BrowserLaunchContext::discover()?;
+        crate::startup_trace::log(
+            "browser",
+            format!("discovered browser context: {}", launch.summary()),
+        );
         let launch_summary = launch.summary();
         let config = launch.build_config()?;
+        crate::startup_trace::log("browser", "browser config built; launching chromiumoxide");
         let (browser, mut handler) = Browser::launch(config)
             .await
             .map_err(|error| format!("{} [{}]", error, launch_summary))?;
+        crate::startup_trace::log("browser", "chromiumoxide browser launched");
 
         tokio::spawn(async move { while let Some(_) = handler.next().await {} });
 

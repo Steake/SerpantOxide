@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -7,6 +8,7 @@ use crate::browser::{NativeBrowserEngine, ReadOnlyBrowserFallback};
 use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
 use crate::llm::{ChatResponse, NativeLLMEngine, ToolCall};
+use crate::mission::{self, DiscoverySignals, MissionProfile};
 use crate::notes::NotesEngine;
 use crate::pool::ToolRecord;
 use crate::pool::WorkerPoolState;
@@ -189,12 +191,14 @@ impl WorkerAgent {
             browser_fallback: Arc::new(ReadOnlyBrowserFallback::new()),
             search,
             graph,
-            max_iterations: 10,
+            max_iterations: 16,
         }
     }
 
     pub async fn run(&self, task: &str, handle: &WorkerHandle) -> Result<String, String> {
-        let mut plan = self.generate_plan(task).await?;
+        let mut mission = self.build_mission_profile(task).await;
+        let mut plan = self.generate_plan(task, &mission).await?;
+        let mut applied_follow_ups = HashSet::new();
         if plan.is_empty() {
             plan.push(PlanStep {
                 id: 1,
@@ -220,12 +224,33 @@ impl WorkerAgent {
         })];
 
         for _ in 0..self.max_iterations {
+            mission = self.build_mission_profile(task).await;
+
             if plan_complete(&plan) {
-                return self.summarize(task, &plan, &messages).await;
+                if let Some(next_steps) =
+                    extend_plan_from_follow_ups(&mission, &plan, &mut applied_follow_ups)
+                {
+                    handle
+                        .log(format!(
+                            "Continuing autonomously toward outcome: {}\nExtended plan:\n{}",
+                            mission.desired_outcome,
+                            next_steps
+                                .iter()
+                                .map(PlanStep::as_line)
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ))
+                        .await;
+                    plan.extend(next_steps);
+                    continue;
+                }
+
+                return self.summarize(task, &mission, &plan, &messages).await;
             }
 
             let prompt = prompts::build_worker_prompt(
                 task,
+                &mission,
                 &plan.iter().map(PlanStep::as_line).collect::<Vec<_>>(),
             );
             let response = self
@@ -244,6 +269,13 @@ impl WorkerAgent {
                     "role": "assistant",
                     "content": response.content
                 }));
+                handle
+                    .log("Worker returned no tool calls; injecting continuation nudge.")
+                    .await;
+                messages.push(json!({
+                    "role": "user",
+                    "content": mission.continuation_nudge(&[])
+                }));
                 continue;
             }
 
@@ -259,12 +291,12 @@ impl WorkerAgent {
                 }));
 
                 if tool_name == "finish" && plan_complete(&plan) {
-                    return self.summarize(task, &plan, &messages).await;
+                    return self.summarize(task, &mission, &plan, &messages).await;
                 }
             }
 
             if plan_has_failure(&plan) {
-                let replanned = self.replan(task, &plan).await?;
+                let replanned = self.replan(task, &mission, &plan).await?;
                 handle
                     .log(format!(
                         "Replanned:\n{}",
@@ -285,14 +317,31 @@ impl WorkerAgent {
         ))
     }
 
-    async fn generate_plan(&self, task: &str) -> Result<Vec<PlanStep>, String> {
+    async fn generate_plan(
+        &self,
+        task: &str,
+        mission: &MissionProfile,
+    ) -> Result<Vec<PlanStep>, String> {
         let response = self
             .llm
             .generate_with_tools(
                 "You create concise penetration testing plans. Always call create_plan.",
                 vec![json!({
                     "role": "user",
-                    "content": format!("Break this pentest task into 2-4 actionable steps.\nTask: {}", task)
+                    "content": format!(
+                        "Break this pentest task into 2-4 actionable steps.\nTask: {}\n\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\nHeuristic basis:\n{}",
+                        task,
+                        mission.preset_title,
+                        mission.resolved_preset,
+                        mission.desired_outcome,
+                        mission.discovery_summary,
+                        mission
+                            .heuristic_basis
+                            .iter()
+                            .map(|item| format!("- {}", item))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
                 })],
                 vec![json!({
                     "type": "function",
@@ -341,6 +390,13 @@ impl WorkerAgent {
             status: StepStatus::Pending,
             result: None,
         }])
+    }
+
+    async fn build_mission_profile(&self, task: &str) -> MissionProfile {
+        let topology = self.graph.read().await.snapshot();
+        let note_categories = self.notes.list_categories().await;
+        let signals = DiscoverySignals::new(topology, note_categories);
+        mission::resolve_mission(mission::default_preset_id(), "", task, &signals)
     }
 
     async fn execute_tool(
@@ -816,6 +872,7 @@ impl WorkerAgent {
     async fn summarize(
         &self,
         task: &str,
+        mission: &MissionProfile,
         plan: &[PlanStep],
         messages: &[Value],
     ) -> Result<String, String> {
@@ -838,8 +895,13 @@ impl WorkerAgent {
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = format!(
-            "Summarize the worker task succinctly.\nTask: {}\n\nPlan outcome:\n{}",
-            task, plan_summary
+            "Summarize the worker task succinctly.\nTask: {}\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\n\nPlan outcome:\n{}",
+            task,
+            mission.preset_title,
+            mission.resolved_preset,
+            mission.desired_outcome,
+            mission.discovery_summary,
+            plan_summary
         );
         let mut summary_messages = messages.to_vec();
         summary_messages.push(json!({
@@ -849,7 +911,12 @@ impl WorkerAgent {
         self.llm.generate_with_history(summary_messages).await
     }
 
-    async fn replan(&self, task: &str, current_plan: &[PlanStep]) -> Result<Vec<PlanStep>, String> {
+    async fn replan(
+        &self,
+        task: &str,
+        mission: &MissionProfile,
+        current_plan: &[PlanStep],
+    ) -> Result<Vec<PlanStep>, String> {
         let failed_step = current_plan
             .iter()
             .find(|step| step.status == StepStatus::Fail)
@@ -866,8 +933,12 @@ impl WorkerAgent {
                 vec![json!({
                     "role": "user",
                     "content": format!(
-                        "The worker plan failed.\nTask: {}\nFailed step: {}\nFailure detail: {}\nPrevious plan:\n{}",
+                        "The worker plan failed.\nTask: {}\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\nFailed step: {}\nFailure detail: {}\nPrevious plan:\n{}",
                         task,
+                        mission.preset_title,
+                        mission.resolved_preset,
+                        mission.desired_outcome,
+                        mission.discovery_summary,
                         failed_step.description,
                         failed_step.result.clone().unwrap_or_default(),
                         prior_plan
@@ -1135,6 +1206,43 @@ fn build_assistant_message(response: &ChatResponse) -> Value {
     }
 
     message
+}
+
+fn extend_plan_from_follow_ups(
+    mission: &MissionProfile,
+    existing_plan: &[PlanStep],
+    applied_follow_ups: &mut HashSet<String>,
+) -> Option<Vec<PlanStep>> {
+    let mut next_steps = Vec::new();
+    let next_start = existing_plan.len() + 1;
+
+    for follow_up in &mission.suggested_follow_ups {
+        let key = follow_up.to_ascii_lowercase();
+        let already_planned = existing_plan
+            .iter()
+            .any(|step| step.description.eq_ignore_ascii_case(follow_up));
+        if already_planned || applied_follow_ups.contains(&key) {
+            continue;
+        }
+
+        applied_follow_ups.insert(key);
+        next_steps.push(PlanStep {
+            id: next_start + next_steps.len(),
+            description: follow_up.clone(),
+            status: StepStatus::Pending,
+            result: None,
+        });
+
+        if next_steps.len() >= 2 {
+            break;
+        }
+    }
+
+    if next_steps.is_empty() {
+        None
+    } else {
+        Some(next_steps)
+    }
 }
 
 fn plan_complete(plan: &[PlanStep]) -> bool {
