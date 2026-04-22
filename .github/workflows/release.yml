@@ -113,6 +113,7 @@ jobs:
 
       - name: Generate release notes
         run: |
+          # Keep the asset names below aligned with the build matrix artifact names above.
           {
             echo "## Serpantoxide ${{ steps.version.outputs.version }}"
             echo
@@ -138,6 +139,7 @@ jobs:
 
       - name: Verify release assets
         run: |
+          # Keep this list aligned with the build matrix artifact names above.
           expected_assets=(
             serpantoxide-linux-x86_64
             serpantoxide-macos-aarch64
