@@ -156,7 +156,7 @@ impl RuntimeService {
             Err(error) => {
                 let _ = raw_event_tx
                     .send(UiEvent::log(format!(
-                        "[Native Browser Engine Error] {}",
+                        "[Native Browser Engine Error] {}. Read-only browser fallback remains available for navigate/get_content/get_links/get_forms.",
                         error
                     )))
                     .await;

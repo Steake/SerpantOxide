@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 
-use crate::browser::NativeBrowserEngine;
+use crate::browser::{NativeBrowserEngine, ReadOnlyBrowserFallback};
 use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
 use crate::llm::{ChatResponse, NativeLLMEngine, ToolCall};
@@ -85,7 +85,10 @@ impl WorkerHandle {
         }
         let _ = self
             .ui_tx
-            .send(UiEvent::worker_status(self.worker_id.clone(), status.to_string()))
+            .send(UiEvent::worker_status(
+                self.worker_id.clone(),
+                status.to_string(),
+            ))
             .await;
     }
 
@@ -111,14 +114,12 @@ impl WorkerHandle {
         };
         let _ = self
             .ui_tx
-            .send(
-                UiEvent::WorkerTool {
-                    worker_id: self.worker_id.clone(),
-                    tool_name: tool_name.to_string(),
-                    args: args_string,
-                    result: None,
-                }
-            )
+            .send(UiEvent::WorkerTool {
+                worker_id: self.worker_id.clone(),
+                tool_name: tool_name.to_string(),
+                args: args_string,
+                result: None,
+            })
             .await;
         tool_id
     }
@@ -145,14 +146,12 @@ impl WorkerHandle {
         if let Some((tool_name, args)) = tool_name {
             let _ = self
                 .ui_tx
-                .send(
-                    UiEvent::WorkerTool {
-                        worker_id: self.worker_id.clone(),
-                        tool_name,
-                        args,
-                        result: Some(result),
-                    }
-                )
+                .send(UiEvent::WorkerTool {
+                    worker_id: self.worker_id.clone(),
+                    tool_name,
+                    args,
+                    result: Some(result),
+                })
                 .await;
         }
     }
@@ -169,6 +168,7 @@ pub struct WorkerAgent {
     llm: Arc<NativeLLMEngine>,
     notes: Arc<NotesEngine>,
     browser: Option<Arc<NativeBrowserEngine>>,
+    browser_fallback: Arc<ReadOnlyBrowserFallback>,
     search: Arc<NativeWebSearch>,
     graph: Arc<RwLock<ShadowGraph>>,
     max_iterations: usize,
@@ -186,6 +186,7 @@ impl WorkerAgent {
             llm,
             notes,
             browser,
+            browser_fallback: Arc::new(ReadOnlyBrowserFallback::new()),
             search,
             graph,
             max_iterations: 10,
@@ -432,10 +433,8 @@ impl WorkerAgent {
         let action = arguments["action"]
             .as_str()
             .ok_or_else(|| "browser.action is required".to_string())?;
-        let browser = self
-            .browser
-            .clone()
-            .ok_or_else(|| "Native browser engine unavailable".to_string())?;
+        let browser = self.browser.clone();
+        let browser_fallback = self.browser_fallback.clone();
         let timeout = arguments["timeout"].as_u64().unwrap_or(30) * 1000;
 
         let result = match action {
@@ -443,52 +442,92 @@ impl WorkerAgent {
                 let url = arguments["url"]
                     .as_str()
                     .ok_or_else(|| "browser.url is required for navigate".to_string())?;
-                browser
-                    .navigate(url, arguments["wait_for"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .navigate(url, arguments["wait_for"].as_str(), timeout)
+                        .await?
+                } else {
+                    browser_fallback
+                        .navigate(url, arguments["wait_for"].as_str(), timeout)
+                        .await?
+                }
             }
             "screenshot" => {
-                browser
-                    .screenshot(arguments["url"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .screenshot(arguments["url"].as_str(), timeout)
+                        .await?
+                } else {
+                    return Err(browser_fallback.unsupported_action_message(action));
+                }
             }
             "get_content" => {
-                browser
-                    .get_content(arguments["url"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .get_content(arguments["url"].as_str(), timeout)
+                        .await?
+                } else {
+                    browser_fallback
+                        .get_content(arguments["url"].as_str(), timeout)
+                        .await?
+                }
             }
             "get_links" => {
-                browser
-                    .get_links(arguments["url"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .get_links(arguments["url"].as_str(), timeout)
+                        .await?
+                } else {
+                    browser_fallback
+                        .get_links(arguments["url"].as_str(), timeout)
+                        .await?
+                }
             }
             "get_forms" => {
-                browser
-                    .get_forms(arguments["url"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .get_forms(arguments["url"].as_str(), timeout)
+                        .await?
+                } else {
+                    browser_fallback
+                        .get_forms(arguments["url"].as_str(), timeout)
+                        .await?
+                }
             }
             "click" => {
                 let selector = arguments["selector"]
                     .as_str()
                     .ok_or_else(|| "browser.selector is required for click".to_string())?;
-                browser
-                    .click(selector, arguments["wait_for"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .click(selector, arguments["wait_for"].as_str(), timeout)
+                        .await?
+                } else {
+                    return Err(browser_fallback.unsupported_action_message(action));
+                }
             }
             "type" => {
                 let selector = arguments["selector"]
                     .as_str()
                     .ok_or_else(|| "browser.selector is required for type".to_string())?;
                 let text = arguments["text"].as_str().unwrap_or("");
-                browser
-                    .type_text(selector, text, arguments["wait_for"].as_str(), timeout)
-                    .await?
+                if let Some(browser) = browser.as_ref() {
+                    browser
+                        .type_text(selector, text, arguments["wait_for"].as_str(), timeout)
+                        .await?
+                } else {
+                    return Err(browser_fallback.unsupported_action_message(action));
+                }
             }
             "execute_js" => {
                 let javascript = arguments["javascript"]
                     .as_str()
                     .ok_or_else(|| "browser.javascript is required for execute_js".to_string())?;
-                browser.execute_js(javascript).await?
+                if let Some(browser) = browser.as_ref() {
+                    browser.execute_js(javascript).await?
+                } else {
+                    return Err(browser_fallback.unsupported_action_message(action));
+                }
             }
             unsupported => {
                 return Err(format!(
