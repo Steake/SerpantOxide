@@ -1,5 +1,11 @@
 # Serpantoxide
 
+[![CI](https://github.com/Steake/SerpantOxide/actions/workflows/ci.yml/badge.svg)](https://github.com/Steake/SerpantOxide/actions/workflows/ci.yml)
+[![Release](https://github.com/Steake/SerpantOxide/actions/workflows/release.yml/badge.svg)](https://github.com/Steake/SerpantOxide/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/Steake/SerpantOxide?include_prereleases)](https://github.com/Steake/SerpantOxide/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+
 **A Rust command centre for autonomous security operations.**
 
 Most "agentic" tooling is a confidence trick performed with logs. Serpantoxide takes the less glamorous view that orchestration should be explicit, typed, inspectable, and difficult to romanticise. It is a Rust runtime for running a crew of security workers with a proper operator surface, shared state, browser control, topology intelligence, and just enough suspicion about its own abstractions to remain useful.

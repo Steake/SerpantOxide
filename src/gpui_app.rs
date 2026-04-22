@@ -535,6 +535,7 @@ mod macos {
 pub use macos::run;
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub fn run(
     _runtime: crate::runtime::RuntimeService,
     _tokio_handle: tokio::runtime::Handle,
