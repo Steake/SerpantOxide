@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,7 @@ use tokio::sync::Mutex;
 pub struct NativeBrowserEngine {
     browser: Arc<Browser>,
     pub active_page: Arc<Mutex<Option<Page>>>,
+    launch_summary: String,
 }
 
 #[derive(Clone)]
@@ -42,22 +44,32 @@ pub struct ReadOnlyBrowserFallback {
     active_page: Arc<Mutex<Option<FallbackPageSnapshot>>>,
 }
 
+struct BrowserLaunchContext {
+    executable: PathBuf,
+    user_data_dir: PathBuf,
+    temp_dir: PathBuf,
+}
+
 impl NativeBrowserEngine {
     pub async fn launch() -> Result<Self, String> {
-        let (browser, mut handler) = Browser::launch(
-            BrowserConfig::builder()
-                .build()
-                .map_err(|e| e.to_string())?,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let launch = BrowserLaunchContext::discover()?;
+        let launch_summary = launch.summary();
+        let config = launch.build_config()?;
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .map_err(|error| format!("{} [{}]", error, launch_summary))?;
 
         tokio::spawn(async move { while let Some(_) = handler.next().await {} });
 
         Ok(Self {
             browser: Arc::new(browser),
             active_page: Arc::new(Mutex::new(None)),
+            launch_summary,
         })
+    }
+
+    pub fn launch_summary(&self) -> &str {
+        &self.launch_summary
     }
 
     pub async fn navigate(
@@ -488,6 +500,52 @@ impl ReadOnlyBrowserFallback {
     }
 }
 
+impl BrowserLaunchContext {
+    fn discover() -> Result<Self, String> {
+        let home_dir = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let executable = resolve_browser_executable(home_dir.as_deref())?;
+        let base_dir = std::env::temp_dir().join("serpantoxide-browser");
+        std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+
+        let session_root = browser_session_root(&base_dir, std::process::id(), &unique_suffix());
+        let user_data_dir = session_root.join("profile");
+        let temp_dir = session_root.join("tmp");
+        std::fs::create_dir_all(&user_data_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            executable,
+            user_data_dir,
+            temp_dir,
+        })
+    }
+
+    fn build_config(&self) -> Result<BrowserConfig, String> {
+        BrowserConfig::builder()
+            .chrome_executable(&self.executable)
+            .new_headless_mode()
+            .user_data_dir(&self.user_data_dir)
+            .launch_timeout(Duration::from_secs(30))
+            .request_timeout(Duration::from_secs(30))
+            .envs(browser_process_envs(&self.temp_dir))
+            .arg("disable-gpu")
+            .arg("no-default-browser-check")
+            .build()
+            .map_err(|error| format!("{} [{}]", error, self.summary()))
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "exe={}, profile={}, tmp={}",
+            self.executable.display(),
+            self.user_data_dir.display(),
+            self.temp_dir.display()
+        )
+    }
+}
+
 fn unique_suffix() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -502,6 +560,192 @@ fn truncate(value: &str, max_chars: usize) -> String {
     } else {
         value.chars().take(max_chars).collect()
     }
+}
+
+fn resolve_browser_executable(home_dir: Option<&Path>) -> Result<PathBuf, String> {
+    first_existing_path(browser_executable_candidates(home_dir)).ok_or_else(|| {
+        "Could not find a Chrome/Chromium executable. Set CHROME to an installed browser binary if auto-detection is insufficient.".to_string()
+    })
+}
+
+fn browser_executable_candidates(home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = std::env::var_os("CHROME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        push_unique_path(&mut candidates, path);
+    }
+
+    for path in search_path_browser_executables() {
+        push_unique_path(&mut candidates, path);
+    }
+
+    for path in standard_browser_locations(home_dir) {
+        push_unique_path(&mut candidates, path);
+    }
+
+    candidates
+}
+
+fn search_path_browser_executables() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return candidates;
+    };
+
+    for directory in std::env::split_paths(&path_var) {
+        for binary_name in browser_binary_names() {
+            push_unique_path(&mut candidates, directory.join(binary_name));
+        }
+    }
+
+    candidates
+}
+
+fn standard_browser_locations(home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_paths = [
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ];
+        for path in app_paths {
+            push_unique_path(&mut candidates, path);
+        }
+        if let Some(home_dir) = home_dir {
+            let user_apps = [
+                home_dir
+                    .join("Applications")
+                    .join("Google Chrome.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Google Chrome"),
+                home_dir
+                    .join("Applications")
+                    .join("Chromium.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Chromium"),
+                home_dir
+                    .join("Applications")
+                    .join("Microsoft Edge.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Microsoft Edge"),
+            ];
+            for path in user_apps {
+                push_unique_path(&mut candidates, path);
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let linux_paths = [
+            PathBuf::from("/usr/bin/google-chrome"),
+            PathBuf::from("/usr/bin/google-chrome-stable"),
+            PathBuf::from("/usr/bin/chromium"),
+            PathBuf::from("/usr/bin/chromium-browser"),
+            PathBuf::from("/snap/bin/chromium"),
+        ];
+        for path in linux_paths {
+            push_unique_path(&mut candidates, path);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(home_dir) = home_dir {
+            let local_app_data = home_dir.join("AppData").join("Local");
+            let program_files = PathBuf::from(r"C:\Program Files");
+            let program_files_x86 = PathBuf::from(r"C:\Program Files (x86)");
+            let windows_paths = [
+                program_files
+                    .join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+                program_files_x86
+                    .join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+                local_app_data
+                    .join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+                program_files_x86
+                    .join("Microsoft")
+                    .join("Edge")
+                    .join("Application")
+                    .join("msedge.exe"),
+            ];
+            for path in windows_paths {
+                push_unique_path(&mut candidates, path);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn browser_binary_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["chrome.exe", "chromium.exe", "msedge.exe"]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        &[
+            "chrome",
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "msedge",
+        ]
+    }
+}
+
+fn first_existing_path(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.iter().any(|candidate| candidate == &path) {
+        candidates.push(path);
+    }
+}
+
+fn browser_session_root(base_dir: &Path, pid: u32, suffix: &str) -> PathBuf {
+    base_dir.join(format!("session-{}-{}", pid, suffix))
+}
+
+fn browser_process_envs(temp_dir: &Path) -> HashMap<String, String> {
+    let mut envs = HashMap::new();
+
+    if let Some(path) = std::env::var_os("PATH").filter(|value| !value.is_empty()) {
+        envs.insert("PATH".to_string(), path.to_string_lossy().to_string());
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        envs.insert("HOME".to_string(), home.to_string_lossy().to_string());
+    }
+    if let Some(lang) = std::env::var_os("LANG").filter(|value| !value.is_empty()) {
+        envs.insert("LANG".to_string(), lang.to_string_lossy().to_string());
+    } else {
+        envs.insert("LANG".to_string(), "en_US.UTF-8".to_string());
+    }
+
+    envs.insert("TMPDIR".to_string(), temp_dir.display().to_string());
+
+    envs
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -680,6 +924,54 @@ mod tests {
                     kind: "select".to_string()
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn picks_first_existing_browser_candidate() {
+        let base_dir =
+            std::env::temp_dir().join(format!("serpantoxide-browser-test-{}", unique_suffix()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let existing = base_dir.join("chromium");
+        std::fs::write(&existing, b"").unwrap();
+
+        let resolved = first_existing_path(vec![
+            base_dir.join("missing-chrome"),
+            existing.clone(),
+            base_dir.join("other"),
+        ]);
+
+        assert_eq!(resolved, Some(existing));
+        let _ = std::fs::remove_file(base_dir.join("chromium"));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn browser_session_root_scopes_profile_to_unique_run_directory() {
+        let base_dir = Path::new("/tmp/serpantoxide-browser");
+        let session_root = browser_session_root(base_dir, 42, "abc123");
+
+        assert_eq!(
+            session_root,
+            PathBuf::from("/tmp/serpantoxide-browser/session-42-abc123")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn standard_locations_include_user_applications_on_macos() {
+        let home_dir = Path::new("/Users/tester");
+        let candidates = standard_browser_locations(Some(home_dir));
+
+        assert!(
+            candidates.contains(
+                &home_dir
+                    .join("Applications")
+                    .join("Google Chrome.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Google Chrome")
+            )
         );
     }
 }
