@@ -1,18 +1,43 @@
 # Serpantoxide
 
-Serpantoxide is the Rust command nerve-centre for autonomous security operations. It exists because orchestration is too important to leave in the custody of ad hoc glue, runtime whim, and the usual theatrical promises about agentic systems. The point here is not to sound futuristic. The point is to make the machinery behave.
+**A Rust command centre for autonomous security operations.**
 
-This repository contains a working offensive-security console with a crew orchestrator, iterative worker agents, browser control, note persistence, topology intelligence, and two operator surfaces: a production TUI and an experimental macOS GPUI shell. It is not a philosophy seminar disguised as a framework. It is an instrument.
+Most "agentic" tooling is a confidence trick performed with logs. Serpantoxide takes the less glamorous view that orchestration should be explicit, typed, inspectable, and difficult to romanticise. It is a Rust runtime for running a crew of security workers with a proper operator surface, shared state, browser control, topology intelligence, and just enough suspicion about its own abstractions to remain useful.
 
-## What It Actually Does
+In plain English: this is a working offensive-security console. It plans, delegates, watches, revises, records, and reports. It has a production TUI, an experimental macOS GPUI shell, and very little interest in pretending that "AI" is a substitute for instrumentation.
 
-- Runs a Ratatui-based terminal interface with live telemetry, worker logs, topology views, and inspection panes.
-- Exposes an experimental macOS GPUI frontend with the same shared runtime.
-- Uses an LLM-driven orchestrator to plan, spawn, monitor, and synthesize worker activity.
-- Executes worker agents as stepwise tool-calling loops with replanning and final summaries.
-- Provides native tools for `terminal`, `browser`, `web_search`, `notes`, `nmap`, `sqlmap`, `osint`, `hosting`, `image_gen`, and `evm_chain`.
-- Persists findings in `loot/notes.json` and builds higher-level hints through a lightweight graph model.
-- Falls back to deterministic mock behavior when the LLM provider key is absent, which is less glamorous than calling it magic and considerably more accurate.
+## Why It Exists
+
+Because the usual arrangement is intolerable.
+
+- Python prototypes become accidental constitutions.
+- Agent frameworks multiply concepts the way damp basements multiply fungus.
+- Tool calls vanish into stringly typed fog.
+- Interfaces soothe the operator precisely when they ought to confess uncertainty.
+
+Serpantoxide is the opposite design instinct: fewer illusions, harder edges, better visibility.
+
+## What You Get
+
+- A live terminal UI with telemetry, worker logs, topology views, inspection panes, and report generation.
+- An experimental native macOS shell built on the same runtime.
+- A crew orchestrator that can plan, spawn, monitor, and synthesise multiple workers.
+- Worker agents that operate as iterative tool-calling loops rather than decorative one-shot prompts.
+- Native tools for `terminal`, `browser`, `web_search`, `notes`, `nmap`, `sqlmap`, `osint`, `hosting`, `image_gen`, and `evm_chain`.
+- Persistent findings in `loot/notes.json`.
+- A lightweight graph model that turns findings into something closer to intelligence.
+- Deterministic mock mode when provider keys are absent, because pretending otherwise would be vulgar.
+
+## The Shape Of The Thing
+
+Serpantoxide is arranged around four deliberate layers:
+
+1. `main.rs` boots the selected frontend.
+2. `runtime.rs` provides the shared command, event, and snapshot model.
+3. `orchestrator.rs` thinks in campaigns.
+4. `worker_agent.rs` does the grubby work and returns with evidence.
+
+That separation matters. The orchestrator is there to think at a level above a shell command. The workers are there to prevent those thoughts from floating away into rhetoric.
 
 ## Quick Start
 
@@ -26,14 +51,15 @@ This repository contains a working offensive-security console with a crew orches
   - `holehe`
   - `sherlock`
   - `theHarvester`
-- Optional API keys:
+- Optional environment variables:
   - `OPENROUTER_API_KEY`
   - `TAVILY_API_KEY`
   - `GOOGLE_API_KEY`
   - `ETHERSCAN_API_KEY`
   - `EVM_RPC_URL`
+  - `LLM_MODEL`
 
-### Run
+### Run It
 
 ```bash
 cargo run
@@ -42,7 +68,7 @@ cargo run
 ### Frontends
 
 ```bash
-# Default interface
+# Default TUI
 cargo run
 
 # Experimental macOS shell
@@ -75,15 +101,6 @@ scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
 /quit                Exit
 ```
 
-## Architecture In Four Parts
-
-1. `main.rs` selects the frontend and boots the runtime.
-2. `runtime.rs` provides the shared command, event, and snapshot layer.
-3. `orchestrator.rs` thinks in campaigns and delegates work.
-4. `worker_agent.rs` does the grubby business of using tools, marking progress, and coming back with something worth reading.
-
-That division is deliberate. The orchestrator is there to think in terms larger than a shell command, and the workers are there to stop those thoughts from remaining ornamental.
-
 ## Tool Surface
 
 Workers can call:
@@ -99,7 +116,7 @@ Workers can call:
 - `image_gen`
 - `evm_chain`
 
-Forced intent prefixes are also supported:
+And if subtlety is getting in the way, forced intent prefixes are available:
 
 ```text
 NMAP: <host>
@@ -115,9 +132,9 @@ EVM: <action and address/query>
 
 ## Configuration
 
-Serpantoxide stores local runtime state in `.serpantoxide_config` and falls back to `LLM_MODEL` when that file is absent. OpenRouter is used when `OPENROUTER_API_KEY` is present; otherwise the runtime drops into deterministic mock behavior. This is not deception. It is merely the difference between a live provider and a rehearsal room.
+Serpantoxide stores local runtime state in `.serpantoxide_config`. If `OPENROUTER_API_KEY` is present, it uses OpenRouter. If it is absent, the runtime drops into deterministic mock behaviour. This is not a scam. It is simply the difference between a live provider and a rehearsal.
 
-Common environment variables:
+Typical configuration:
 
 ```bash
 OPENROUTER_API_KEY=...
@@ -171,6 +188,6 @@ cargo check
 cargo test
 ```
 
-## Legal And Moral Clarity
+## Final Point Of Order
 
-Use this only against targets you are authorised to assess. A fast tool does not become an ethical tool by the simple expedient of being well-written.
+Use this only against systems you are authorised to assess. Good tooling does not suspend ethics. It merely removes the excuse of incompetence.
