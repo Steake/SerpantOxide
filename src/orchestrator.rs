@@ -175,7 +175,12 @@ impl Orchestrator {
             ));
         }
         if self.browser.is_some() {
-            augmented_insights.push("Browser engine is available for web interaction.".to_string());
+            augmented_insights
+                .push("Native browser engine is available for web interaction.".to_string());
+        } else {
+            augmented_insights.push(
+                "Read-only browser fallback is available for navigate/get_content/get_links/get_forms. Screenshot, click, type, and execute_js require Chromium.".to_string(),
+            );
         }
         if !self.search.api_key().is_empty() {
             augmented_insights.push("Web intelligence search is available.".to_string());
