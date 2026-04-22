@@ -1,5 +1,5 @@
 [package]
-name = "Serpantoxide"
+name = "serpantoxide"
 version = "0.1.0"
 edition = "2024"
 description = "A Rust command centre for autonomous security operations — orchestrator, worker agents, TUI, and native offensive-security tooling in one binary."
@@ -10,6 +10,10 @@ keywords = ["security", "pentesting", "agent", "tui", "osint"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 rust-version = "1.85"
+
+[[bin]]
+name = "Serpantoxide"
+path = "src/main.rs"
 
 [dependencies]
 rustpython-vm = { version = "0.4.0", features = ["freeze-stdlib"] }

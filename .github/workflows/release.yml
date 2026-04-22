@@ -36,6 +36,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Derive release version
+        id: version
+        run: |
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,7 +53,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Stage binary (Unix)
         run: |
@@ -60,6 +66,7 @@ jobs:
           bash scripts/package_macos_app.sh \
             --target ${{ matrix.target }} \
             --out-dir dist \
+            --version ${{ steps.version.outputs.app_version }} \
             --skip-build \
             --zip
           cp "dist/${BINARY_NAME}.zip" "${{ matrix.artifact }}-app.zip"
@@ -105,30 +112,46 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
-        id: notes
         run: |
-          cat <<'EOF' > release_notes.md
-          ## Serpantoxide ${{ steps.version.outputs.version }}
+          {
+            echo "## Serpantoxide ${{ steps.version.outputs.version }}"
+            echo
+            echo "A Rust command centre for autonomous security operations."
+            echo
+            echo "### Downloads"
+            echo
+            echo "| Platform | Binary | App Bundle |"
+            echo "|----------|--------|------------|"
+            echo '| Linux x86_64 | `serpantoxide-linux-x86_64` | — |'
+            echo '| macOS Apple Silicon | `serpantoxide-macos-aarch64` | `serpantoxide-macos-aarch64-app.zip` |'
+            echo '| macOS Intel | `serpantoxide-macos-x86_64` | `serpantoxide-macos-x86_64-app.zip` |'
+            echo
+            echo "### Quick Start"
+            echo
+            echo '```bash'
+            echo "chmod +x serpantoxide-linux-x86_64"
+            echo "./serpantoxide-linux-x86_64"
+            echo '```'
+            echo
+            echo "See [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions."
+          } > release_notes.md
 
-          A Rust command centre for autonomous security operations.
+      - name: Verify release assets
+        run: |
+          expected_assets=(
+            serpantoxide-linux-x86_64
+            serpantoxide-macos-aarch64
+            serpantoxide-macos-aarch64-app.zip
+            serpantoxide-macos-x86_64
+            serpantoxide-macos-x86_64-app.zip
+          )
 
-          ### Downloads
-
-          | Platform | Binary | App Bundle |
-          |----------|--------|------------|
-          | Linux x86_64 | `serpantoxide-linux-x86_64` | — |
-          | macOS Apple Silicon | `serpantoxide-macos-aarch64` | `serpantoxide-macos-aarch64-app.zip` |
-          | macOS Intel | `serpantoxide-macos-x86_64` | `serpantoxide-macos-x86_64-app.zip` |
-
-          ### Quick Start
-
-          ```bash
-          chmod +x serpantoxide-linux-x86_64
-          ./serpantoxide-linux-x86_64
-          ```
-
-          See [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
-          EOF
+          for asset in "${expected_assets[@]}"; do
+            if [[ ! -f "release_assets/${asset}" ]]; then
+              echo "Missing release asset: ${asset}" >&2
+              exit 1
+            fi
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -138,4 +161,3 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: release_assets/*
-          fail_on_unmatched_files: false

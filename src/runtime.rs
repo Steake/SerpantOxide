@@ -15,6 +15,7 @@ use crate::prompts;
 use crate::web_search::NativeWebSearch;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum RuntimeCommand {
     SetTarget { target: String },
     RunAgent { task: String },
@@ -45,6 +46,7 @@ struct RuntimeUiState {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct RuntimeWorkerSnapshot {
     pub id: String,
     pub task: String,
@@ -63,12 +65,14 @@ pub struct RuntimeWorkerSnapshot {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct RuntimeNoteCategory {
     pub name: String,
     pub count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct RuntimeSnapshot {
     pub target: String,
     pub llm: LlmTelemetrySnapshot,
@@ -109,8 +113,10 @@ impl From<&WorkerInfo> for RuntimeWorkerSnapshot {
 pub struct RuntimeService {
     command_tx: mpsc::Sender<RuntimeCommand>,
     events_tx: broadcast::Sender<UiEvent>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ui_state: Arc<RwLock<RuntimeUiState>>,
     llm_engine: Arc<NativeLLMEngine>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     notes_engine: Arc<NotesEngine>,
     graph: Arc<RwLock<ShadowGraph>>,
     target_shared: Arc<RwLock<String>>,
@@ -227,6 +233,7 @@ impl RuntimeService {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub async fn send_command(&self, command: RuntimeCommand) -> Result<(), String> {
         self.command_tx
             .send(command)
@@ -242,6 +249,7 @@ impl RuntimeService {
         self.events_tx.subscribe()
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub async fn snapshot(&self) -> RuntimeSnapshot {
         let ui_state = self.ui_state.read().await.clone();
         let target = self.target_shared.read().await.clone();
@@ -732,6 +740,7 @@ pub fn parse_operator_input(input: &str) -> Result<RuntimeCommand, String> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn runtime_models_to_options(models: &[OpenRouterModel]) -> Vec<String> {
     models
         .iter()

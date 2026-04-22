@@ -3,28 +3,6 @@
 version = 4
 
 [[package]]
-name = "Serpantoxide"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chromiumoxide",
- "chrono",
- "crossterm",
- "dotenv",
- "futures",
- "gpui",
- "petgraph",
- "ratatui",
- "regex",
- "reqwest 0.12.28",
- "rustpython-pylib",
- "rustpython-vm",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5157,6 +5135,28 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serpantoxide"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chromiumoxide",
+ "chrono",
+ "crossterm",
+ "dotenv",
+ "futures",
+ "gpui",
+ "petgraph",
+ "ratatui",
+ "regex",
+ "reqwest 0.12.28",
+ "rustpython-pylib",
+ "rustpython-vm",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

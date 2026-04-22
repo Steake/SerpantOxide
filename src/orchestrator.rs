@@ -48,10 +48,6 @@ impl Orchestrator {
         }
     }
 
-    pub async fn run(&self, target: &str, task: &str) -> Result<(), String> {
-        self.run_crew_mode(target, task).await
-    }
-
     pub async fn run_swarm_mode(&self, target: &str, task: &str) -> Result<(), String> {
         self.run_crew_mode(target, task).await
     }

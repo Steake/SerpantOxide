@@ -8,6 +8,7 @@ TARGET_TRIPLE=""
 OUT_DIR="dist"
 ZIP_BUNDLE="0"
 SKIP_BUILD="0"
+APP_VERSION=""
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,7 @@ Options:
   --target <triple>    Cargo target triple, e.g. aarch64-apple-darwin
   --out-dir <path>     Output directory for the .app bundle (default: dist)
   --bundle-id <id>     CFBundleIdentifier value
+  --version <value>    CFBundleShortVersionString / CFBundleVersion value
   --zip                Also create a .zip archive next to the .app bundle
   --skip-build         Reuse an existing binary in target/
   -h, --help           Show this help text
@@ -49,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       BUNDLE_ID="${2:?missing bundle id}"
       shift 2
       ;;
+    --version)
+      APP_VERSION="${2:?missing version}"
+      shift 2
+      ;;
     --zip)
       ZIP_BUNDLE="1"
       shift
@@ -73,6 +79,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+if [[ -z "${APP_VERSION}" ]]; then
+  APP_VERSION="$(
+    python3 - <<'PY'
+import pathlib
+import tomllib
+
+package = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]
+print(package["version"])
+PY
+  )"
+fi
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This packaging script must run on macOS." >&2
   exit 1
@@ -87,7 +105,7 @@ else
 fi
 
 if [[ "${SKIP_BUILD}" != "1" ]]; then
-  cargo build "--${PROFILE}" "${TARGET_ARGS[@]}"
+  cargo build --locked "--${PROFILE}" "${TARGET_ARGS[@]}"
 fi
 
 if [[ ! -x "${BINARY_PATH}" ]]; then
@@ -144,9 +162,9 @@ cat > "${INFO_PLIST_PATH}" <<EOF
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0</string>
+  <string>${APP_VERSION}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
