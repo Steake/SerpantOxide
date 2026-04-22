@@ -347,13 +347,15 @@ impl ReadOnlyBrowserFallback {
         timeout_ms: u64,
     ) -> Result<String, String> {
         let snapshot = self.fetch_page(url, timeout_ms).await?;
+        let page_url = snapshot.url.clone();
+        let page_title = snapshot.title.clone();
         let mut active = self.active_page.lock().await;
-        *active = Some(snapshot.clone());
+        *active = Some(snapshot);
         drop(active);
 
         let mut lines = vec![
-            format!("Navigated to: {}", snapshot.url),
-            format!("Title: {}", snapshot.title),
+            format!("Navigated to: {}", page_url),
+            format!("Title: {}", page_title),
             "Mode: HTTP fallback (native browser engine unavailable)".to_string(),
         ];
         if let Some(selector) = wait_for {
@@ -368,8 +370,8 @@ impl ReadOnlyBrowserFallback {
     pub async fn get_content(&self, url: Option<&str>, timeout_ms: u64) -> Result<String, String> {
         let snapshot = self.page_for_read(url, timeout_ms).await?;
         let content = extract_body_text(&snapshot.html);
-        let content = if content.len() > 5_000 {
-            format!("{}\n... (truncated)", &content[..5_000])
+        let content = if content.chars().count() > 5_000 {
+            format!("{}\n... (truncated)", truncate(&content, 5_000))
         } else {
             content
         };
