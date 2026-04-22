@@ -134,7 +134,7 @@ jobs:
             echo "./serpantoxide-linux-x86_64"
             echo '```'
             echo
-            echo "See [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions."
+            echo "See [README](https://github.com/${{ github.repository }}/blob/master/README.md) for full setup instructions."
           } > release_notes.md
 
       - name: Verify release assets

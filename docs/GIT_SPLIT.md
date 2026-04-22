@@ -12,7 +12,7 @@ git tag -a v0.1b <split-commit> -m "Serpantoxide v0.1b"
 After adding a new remote for the standalone repository, push the split branch and tag:
 
 ```bash
-git push <new-remote> serpantoxide-v0.1b:main
+git push <new-remote> serpantoxide-v0.1b:master
 git push <new-remote> v0.1b
 ```
 
