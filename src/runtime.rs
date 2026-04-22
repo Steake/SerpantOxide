@@ -143,20 +143,24 @@ impl RuntimeService {
 
         let browser_engine = match NativeBrowserEngine::launch().await {
             Ok(engine) => {
+                let launch_summary = engine.launch_summary().to_string();
                 let _ = raw_event_tx
                     .send(UiEvent::log(
                         "Booting Chromiumoxide Native Engine over CDP...",
                     ))
                     .await;
                 let _ = raw_event_tx
-                    .send(UiEvent::log("   -> Chromiumoxide CDP bound successfully!"))
+                    .send(UiEvent::log(format!(
+                        "   -> Chromiumoxide CDP bound successfully! [{}]",
+                        launch_summary
+                    )))
                     .await;
                 Some(Arc::new(engine))
             }
             Err(error) => {
                 let _ = raw_event_tx
                     .send(UiEvent::log(format!(
-                        "[Native Browser Engine Error] {}",
+                        "[Native Browser Engine Error] {}. Read-only browser fallback remains available for navigate/get_content/get_links/get_forms.",
                         error
                     )))
                     .await;

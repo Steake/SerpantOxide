@@ -1,5 +1,7 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chromiumoxide::Page;
@@ -7,30 +9,73 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
+use reqwest::{Client, Url};
+use scraper::{ElementRef, Html, Selector};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 pub struct NativeBrowserEngine {
     browser: Arc<Browser>,
     pub active_page: Arc<Mutex<Option<Page>>>,
+    launch_summary: String,
+}
+
+#[derive(Clone)]
+struct FallbackPageSnapshot {
+    url: String,
+    html: String,
+    title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FallbackFormInput {
+    name: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FallbackForm {
+    action: String,
+    method: String,
+    inputs: Vec<FallbackFormInput>,
+}
+
+pub struct ReadOnlyBrowserFallback {
+    client: Client,
+    active_page: Arc<Mutex<Option<FallbackPageSnapshot>>>,
+}
+
+const BROWSER_SESSION_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24);
+const BROWSER_SESSION_MAX_COUNT: usize = 16;
+const BROWSER_SESSION_EVICTION_GRACE_PERIOD: Duration = Duration::from_secs(60 * 30);
+static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct BrowserLaunchContext {
+    executable: PathBuf,
+    user_data_dir: PathBuf,
+    temp_dir: PathBuf,
 }
 
 impl NativeBrowserEngine {
     pub async fn launch() -> Result<Self, String> {
-        let (browser, mut handler) = Browser::launch(
-            BrowserConfig::builder()
-                .build()
-                .map_err(|e| e.to_string())?,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let launch = BrowserLaunchContext::discover()?;
+        let launch_summary = launch.summary();
+        let config = launch.build_config()?;
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .map_err(|error| format!("{} [{}]", error, launch_summary))?;
 
         tokio::spawn(async move { while let Some(_) = handler.next().await {} });
 
         Ok(Self {
             browser: Arc::new(browser),
             active_page: Arc::new(Mutex::new(None)),
+            launch_summary,
         })
+    }
+
+    pub fn launch_summary(&self) -> &str {
+        &self.launch_summary
     }
 
     pub async fn navigate(
@@ -305,12 +350,245 @@ impl NativeBrowserEngine {
     }
 }
 
+impl ReadOnlyBrowserFallback {
+    pub fn new() -> Self {
+        Self {
+            client: Client::new(),
+            active_page: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn navigate(
+        &self,
+        url: &str,
+        wait_for: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<String, String> {
+        let snapshot = self.fetch_page(url, timeout_ms).await?;
+        let page_url = snapshot.url.clone();
+        let page_title = snapshot.title.clone();
+        let mut active = self.active_page.lock().await;
+        *active = Some(snapshot);
+        drop(active);
+
+        let mut lines = vec![
+            format!("Navigated to: {}", page_url),
+            format!("Title: {}", page_title),
+            "Mode: HTTP fallback (native browser engine unavailable)".to_string(),
+        ];
+        if let Some(selector) = wait_for {
+            lines.push(format!(
+                "Note: wait_for '{}' was ignored because the HTTP fallback does not execute DOM waits.",
+                selector
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    pub async fn get_content(&self, url: Option<&str>, timeout_ms: u64) -> Result<String, String> {
+        let snapshot = self.page_for_read(url, timeout_ms).await?;
+        let content = extract_body_text(&snapshot.html);
+        let content = if content.chars().count() > 5_000 {
+            format!("{}\n... (truncated)", truncate(&content, 5_000))
+        } else {
+            content
+        };
+
+        Ok(format!(
+            "Page content:\n{}\n\nMode: HTTP fallback (native browser engine unavailable)",
+            content
+        ))
+    }
+
+    pub async fn get_links(&self, url: Option<&str>, timeout_ms: u64) -> Result<String, String> {
+        let snapshot = self.page_for_read(url, timeout_ms).await?;
+        let base_url = Url::parse(&snapshot.url).map_err(|e| e.to_string())?;
+        let links = extract_links(&snapshot.html, &base_url);
+
+        if links.is_empty() {
+            return Ok("No links found on page".to_string());
+        }
+
+        let mut lines = vec![
+            "Found links:".to_string(),
+            "Mode: HTTP fallback (native browser engine unavailable)".to_string(),
+        ];
+        for (text, href) in links.iter().take(50) {
+            lines.push(format!("  - [{}] {}", truncate(text, 50), href));
+        }
+        if links.len() > 50 {
+            lines.push(format!("  ... and {} more links", links.len() - 50));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    pub async fn get_forms(&self, url: Option<&str>, timeout_ms: u64) -> Result<String, String> {
+        let snapshot = self.page_for_read(url, timeout_ms).await?;
+        let base_url = Url::parse(&snapshot.url).map_err(|e| e.to_string())?;
+        let forms = extract_forms(&snapshot.html, &base_url);
+
+        if forms.is_empty() {
+            return Ok("No forms found on page".to_string());
+        }
+
+        let mut lines = vec![
+            "Found forms:".to_string(),
+            "Mode: HTTP fallback (native browser engine unavailable)".to_string(),
+        ];
+        for (idx, form) in forms.iter().enumerate() {
+            lines.push(String::new());
+            lines.push(format!("Form {}:", idx + 1));
+            lines.push(format!("  Action: {}", form.action));
+            lines.push(format!("  Method: {}", form.method));
+            if !form.inputs.is_empty() {
+                lines.push("  Inputs:".to_string());
+                for input in &form.inputs {
+                    lines.push(format!("    - {} ({})", input.name, input.kind));
+                }
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    pub fn unsupported_action_message(&self, action: &str) -> String {
+        format!(
+            "Browser action '{}' requires the native Chromium engine. The HTTP fallback only supports navigate, get_content, get_links, and get_forms.",
+            action
+        )
+    }
+
+    async fn page_for_read(
+        &self,
+        url: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<FallbackPageSnapshot, String> {
+        if let Some(url) = url {
+            return self.fetch_and_store(url, timeout_ms).await;
+        }
+
+        self.active_page.lock().await.clone().ok_or_else(|| {
+            "No active page. Navigate first or provide a url for browser inspection.".to_string()
+        })
+    }
+
+    async fn fetch_and_store(
+        &self,
+        url: &str,
+        timeout_ms: u64,
+    ) -> Result<FallbackPageSnapshot, String> {
+        let snapshot = self.fetch_page(url, timeout_ms).await?;
+        let mut active = self.active_page.lock().await;
+        *active = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn fetch_page(&self, url: &str, timeout_ms: u64) -> Result<FallbackPageSnapshot, String> {
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_millis(timeout_ms.max(1)))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+
+        let final_url = response.url().to_string();
+        let html = response.text().await.map_err(|e| e.to_string())?;
+        let title = extract_title(&html).unwrap_or_else(|| "No Title".to_string());
+
+        Ok(FallbackPageSnapshot {
+            url: final_url,
+            html,
+            title,
+        })
+    }
+}
+
+impl BrowserLaunchContext {
+    fn discover() -> Result<Self, String> {
+        let home_dir = Self::discover_home_dir();
+        let executable = resolve_browser_executable(home_dir.as_deref())?;
+        let base_dir = std::env::temp_dir().join("serpantoxide-browser");
+        std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+        cleanup_stale_browser_sessions(&base_dir);
+
+        let session_root = browser_session_root(&base_dir, std::process::id(), &unique_suffix());
+        let user_data_dir = session_root.join("profile");
+        let temp_dir = session_root.join("tmp");
+        std::fs::create_dir_all(&user_data_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            executable,
+            user_data_dir,
+            temp_dir,
+        })
+    }
+
+    fn discover_home_dir() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+
+        #[cfg(windows)]
+        {
+            home.or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| {
+                let home_drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+                let home_path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+                let mut path = PathBuf::from(home_drive);
+                path.push(home_path);
+                Some(path)
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            home
+        }
+    }
+
+    fn build_config(&self) -> Result<BrowserConfig, String> {
+        BrowserConfig::builder()
+            .chrome_executable(&self.executable)
+            .new_headless_mode()
+            .user_data_dir(&self.user_data_dir)
+            .launch_timeout(Duration::from_secs(30))
+            .request_timeout(Duration::from_secs(30))
+            .envs(browser_process_envs(&self.temp_dir))
+            .arg("disable-gpu")
+            .arg("no-default-browser-check")
+            .build()
+            .map_err(|error| format!("{} [{}]", error, self.summary()))
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "exe={}, profile={}, tmp={}",
+            self.executable.display(),
+            self.user_data_dir.display(),
+            self.temp_dir.display()
+        )
+    }
+}
+
 fn unique_suffix() -> String {
-    SystemTime::now()
+    let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        .to_string()
+        .unwrap_or_default();
+    let counter = UNIQUE_SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}",
+        duration.as_secs(),
+        duration.subsec_nanos(),
+        counter
+    )
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -318,5 +596,582 @@ fn truncate(value: &str, max_chars: usize) -> String {
         value.to_string()
     } else {
         value.chars().take(max_chars).collect()
+    }
+}
+
+fn resolve_browser_executable(home_dir: Option<&Path>) -> Result<PathBuf, String> {
+    first_existing_path(browser_executable_candidates(home_dir)).ok_or_else(|| {
+        "Could not find a Chrome/Chromium executable. Set CHROME to an installed browser binary if auto-detection is insufficient.".to_string()
+    })
+}
+
+fn browser_executable_candidates(home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = std::env::var_os("CHROME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        push_unique_path(&mut candidates, path);
+    }
+
+    for path in search_path_browser_executables() {
+        push_unique_path(&mut candidates, path);
+    }
+
+    for path in standard_browser_locations(home_dir) {
+        push_unique_path(&mut candidates, path);
+    }
+
+    candidates
+}
+
+fn search_path_browser_executables() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return candidates;
+    };
+
+    for directory in std::env::split_paths(&path_var) {
+        for binary_name in browser_binary_names() {
+            push_unique_path(&mut candidates, directory.join(binary_name));
+        }
+    }
+
+    candidates
+}
+
+fn standard_browser_locations(home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_paths = [
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ];
+        for path in app_paths {
+            push_unique_path(&mut candidates, path);
+        }
+        if let Some(home_dir) = home_dir {
+            let user_apps = [
+                home_dir
+                    .join("Applications")
+                    .join("Google Chrome.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Google Chrome"),
+                home_dir
+                    .join("Applications")
+                    .join("Chromium.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Chromium"),
+                home_dir
+                    .join("Applications")
+                    .join("Microsoft Edge.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Microsoft Edge"),
+            ];
+            for path in user_apps {
+                push_unique_path(&mut candidates, path);
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let linux_paths = [
+            PathBuf::from("/usr/bin/google-chrome"),
+            PathBuf::from("/usr/bin/google-chrome-stable"),
+            PathBuf::from("/usr/bin/chromium"),
+            PathBuf::from("/usr/bin/chromium-browser"),
+            PathBuf::from("/snap/bin/chromium"),
+        ];
+        for path in linux_paths {
+            push_unique_path(&mut candidates, path);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let program_files = PathBuf::from(r"C:\Program Files");
+        let program_files_x86 = PathBuf::from(r"C:\Program Files (x86)");
+        let windows_paths = [
+            program_files
+                .join("Google")
+                .join("Chrome")
+                .join("Application")
+                .join("chrome.exe"),
+            program_files_x86
+                .join("Google")
+                .join("Chrome")
+                .join("Application")
+                .join("chrome.exe"),
+            program_files
+                .join("Microsoft")
+                .join("Edge")
+                .join("Application")
+                .join("msedge.exe"),
+            program_files_x86
+                .join("Microsoft")
+                .join("Edge")
+                .join("Application")
+                .join("msedge.exe"),
+        ];
+        for path in windows_paths {
+            push_unique_path(&mut candidates, path);
+        }
+
+        if let Some(home_dir) = home_dir {
+            let local_app_data = home_dir.join("AppData").join("Local");
+            let user_paths = [
+                local_app_data
+                    .join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+                local_app_data
+                    .join("Microsoft")
+                    .join("Edge")
+                    .join("Application")
+                    .join("msedge.exe"),
+            ];
+            for path in user_paths {
+                push_unique_path(&mut candidates, path);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn browser_binary_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["chrome.exe", "chromium.exe", "msedge.exe"]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        &[
+            "chrome",
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "msedge",
+        ]
+    }
+}
+
+fn first_existing_path(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .find(|path| is_launchable_browser_path(path))
+}
+
+fn is_launchable_browser_path(path: &Path) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+        mode & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.iter().any(|candidate| candidate == &path) {
+        candidates.push(path);
+    }
+}
+
+fn browser_session_root(base_dir: &Path, pid: u32, suffix: &str) -> PathBuf {
+    base_dir.join(format!("session-{}-{}", pid, suffix))
+}
+
+fn cleanup_stale_browser_sessions(base_dir: &Path) {
+    cleanup_browser_sessions(
+        base_dir,
+        SystemTime::now(),
+        BROWSER_SESSION_MAX_COUNT,
+        BROWSER_SESSION_MAX_AGE,
+        BROWSER_SESSION_EVICTION_GRACE_PERIOD,
+    );
+}
+
+fn cleanup_browser_sessions(
+    base_dir: &Path,
+    now: SystemTime,
+    max_count: usize,
+    max_age: Duration,
+    eviction_grace_period: Duration,
+) {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return;
+    };
+
+    let mut session_dirs = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_browser_session_directory(&path) {
+                return None;
+            }
+
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .or_else(|_| metadata.created())
+                .unwrap_or(UNIX_EPOCH);
+            Some((path, modified))
+        })
+        .collect::<Vec<_>>();
+
+    session_dirs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    for (index, (path, modified)) in session_dirs.into_iter().enumerate() {
+        let age = now.duration_since(modified).unwrap_or_default();
+        let should_remove = age >= max_age || (index >= max_count && age >= eviction_grace_period);
+
+        if should_remove {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn is_browser_session_directory(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("session-"))
+}
+
+fn browser_process_envs(temp_dir: &Path) -> HashMap<String, String> {
+    let mut envs = HashMap::new();
+
+    if let Some(path) = std::env::var_os("PATH").filter(|value| !value.is_empty()) {
+        envs.insert("PATH".to_string(), path.to_string_lossy().to_string());
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        envs.insert("HOME".to_string(), home.to_string_lossy().to_string());
+    }
+    if let Some(lang) = std::env::var_os("LANG").filter(|value| !value.is_empty()) {
+        envs.insert("LANG".to_string(), lang.to_string_lossy().to_string());
+    } else {
+        envs.insert("LANG".to_string(), "en_US.UTF-8".to_string());
+    }
+
+    envs.insert("TMPDIR".to_string(), temp_dir.display().to_string());
+
+    envs
+}
+
+fn extract_title(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let title_selector = selector("title");
+    document
+        .select(&title_selector)
+        .next()
+        .map(element_text)
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_body_text(html: &str) -> String {
+    let document = Html::parse_document(html);
+    let body_selector = selector("body");
+    let text = document
+        .select(&body_selector)
+        .next()
+        .map(element_text)
+        .unwrap_or_default();
+
+    if text.is_empty() {
+        "No readable body content found".to_string()
+    } else {
+        text
+    }
+}
+
+fn extract_links(html: &str, base_url: &Url) -> Vec<(String, String)> {
+    let document = Html::parse_document(html);
+    let link_selector = selector("a[href]");
+    document
+        .select(&link_selector)
+        .filter_map(|link| {
+            let href = link.value().attr("href")?;
+            let resolved = base_url
+                .join(href)
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| href.to_string());
+            let text = element_text(link);
+            Some((
+                if text.is_empty() {
+                    "link".to_string()
+                } else {
+                    text
+                },
+                resolved,
+            ))
+        })
+        .collect()
+}
+
+fn extract_forms(html: &str, base_url: &Url) -> Vec<FallbackForm> {
+    let document = Html::parse_document(html);
+    let form_selector = selector("form");
+    let field_selector = selector("input, textarea, select");
+
+    document
+        .select(&form_selector)
+        .map(|form| {
+            let action_attr = form.value().attr("action").unwrap_or("");
+            let action = if action_attr.is_empty() {
+                base_url.to_string()
+            } else {
+                base_url
+                    .join(action_attr)
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| action_attr.to_string())
+            };
+            let method = form.value().attr("method").unwrap_or("GET").to_uppercase();
+            let inputs = form
+                .select(&field_selector)
+                .map(|field| FallbackFormInput {
+                    name: field.value().attr("name").unwrap_or("unnamed").to_string(),
+                    kind: field
+                        .value()
+                        .attr("type")
+                        .unwrap_or(field.value().name())
+                        .to_string(),
+                })
+                .collect::<Vec<_>>();
+
+            FallbackForm {
+                action,
+                method,
+                inputs,
+            }
+        })
+        .collect()
+}
+
+fn element_text(element: ElementRef<'_>) -> String {
+    element
+        .text()
+        .map(str::trim)
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn selector(pattern: &str) -> Selector {
+    Selector::parse(pattern).expect("valid CSS selector")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_links_with_resolved_urls() {
+        let html = r#"
+            <html>
+              <body>
+                <a href="/apply">Apply now</a>
+                <a href="https://example.org/help">Help</a>
+              </body>
+            </html>
+        "#;
+
+        let links = extract_links(
+            html,
+            &Url::parse("https://www.evisagov.co/official/en/").unwrap(),
+        );
+
+        assert_eq!(
+            links[0],
+            (
+                "Apply now".to_string(),
+                "https://www.evisagov.co/apply".to_string()
+            )
+        );
+        assert_eq!(
+            links[1],
+            ("Help".to_string(), "https://example.org/help".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_forms_and_body_text() {
+        let html = r#"
+            <html>
+              <head><title>Visa form</title></head>
+              <body>
+                <main>
+                  <h1>Request visa</h1>
+                  <form action="/submit" method="post">
+                    <input name="passport" type="text" />
+                    <textarea name="notes"></textarea>
+                    <select name="country"></select>
+                  </form>
+                </main>
+              </body>
+            </html>
+        "#;
+
+        let forms = extract_forms(html, &Url::parse("https://example.com/apply").unwrap());
+
+        assert_eq!(extract_title(html).as_deref(), Some("Visa form"));
+        assert!(extract_body_text(html).contains("Request visa"));
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0].action, "https://example.com/submit");
+        assert_eq!(forms[0].method, "POST");
+        assert_eq!(
+            forms[0].inputs,
+            vec![
+                FallbackFormInput {
+                    name: "passport".to_string(),
+                    kind: "text".to_string()
+                },
+                FallbackFormInput {
+                    name: "notes".to_string(),
+                    kind: "textarea".to_string()
+                },
+                FallbackFormInput {
+                    name: "country".to_string(),
+                    kind: "select".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn picks_first_existing_browser_candidate() {
+        let base_dir =
+            std::env::temp_dir().join(format!("serpantoxide-browser-test-{}", unique_suffix()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let existing = base_dir.join("chromium");
+        std::fs::write(&existing, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&existing).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&existing, permissions).unwrap();
+        }
+
+        let resolved = first_existing_path(vec![
+            base_dir.join("missing-chrome"),
+            existing.clone(),
+            base_dir.join("other"),
+        ]);
+
+        assert_eq!(resolved, Some(existing));
+        let _ = std::fs::remove_file(base_dir.join("chromium"));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn ignores_non_launchable_browser_candidates() {
+        let base_dir =
+            std::env::temp_dir().join(format!("serpantoxide-browser-test-{}", unique_suffix()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let directory = base_dir.join("directory");
+        std::fs::create_dir_all(&directory).unwrap();
+
+        #[cfg(unix)]
+        let non_executable = base_dir.join("chrome");
+        let executable = base_dir.join("chromium");
+        std::fs::write(&executable, b"").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(&non_executable, b"").unwrap();
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+        }
+
+        #[cfg(unix)]
+        let candidates = vec![directory, non_executable, executable.clone()];
+        #[cfg(not(unix))]
+        let candidates = vec![directory, executable.clone()];
+
+        let resolved = first_existing_path(candidates);
+
+        assert_eq!(resolved, Some(executable));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn browser_session_root_scopes_profile_to_unique_run_directory() {
+        let base_dir = Path::new("/tmp/serpantoxide-browser");
+        let session_root = browser_session_root(base_dir, 42, "abc123");
+
+        assert_eq!(
+            session_root,
+            PathBuf::from("/tmp/serpantoxide-browser/session-42-abc123")
+        );
+    }
+
+    #[test]
+    fn cleanup_browser_sessions_removes_expired_session_directories() {
+        let base_dir =
+            std::env::temp_dir().join(format!("serpantoxide-browser-test-{}", unique_suffix()));
+        let session_dir = browser_session_root(&base_dir, 42, "expired");
+        let keep_dir = base_dir.join("keep-me");
+
+        std::fs::create_dir_all(session_dir.join("profile")).unwrap();
+        std::fs::create_dir_all(&keep_dir).unwrap();
+
+        cleanup_browser_sessions(
+            &base_dir,
+            SystemTime::now(),
+            16,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        assert!(!session_dir.exists());
+        assert!(keep_dir.exists());
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn standard_locations_include_user_applications_on_macos() {
+        let home_dir = Path::new("/Users/tester");
+        let candidates = standard_browser_locations(Some(home_dir));
+
+        assert!(
+            candidates.contains(
+                &home_dir
+                    .join("Applications")
+                    .join("Google Chrome.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Google Chrome")
+            )
+        );
     }
 }
