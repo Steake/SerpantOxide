@@ -49,11 +49,6 @@ impl NotesEngine {
         map.get(category).cloned().unwrap_or_default()
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub async fn all_notes(&self) -> HashMap<String, Vec<Note>> {
-        self.store.read().await.clone()
-    }
-
     pub async fn upsert_note(
         &self,
         key: &str,

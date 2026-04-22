@@ -5,7 +5,10 @@ pub fn help_text() -> &'static str {
   /target <host>       Set the active target
   /tools               Show native worker capabilities
   /notes [category]    Show saved findings
+  /cancel <worker-id>  Cancel a running worker
+  /retry <worker-id>   Requeue a worker task
   /memory              Show graph intelligence summary
+  /topology            Show the current topology view
   /prompt              Show the crew system prompt
   /report              Generate a markdown report
   /models              Open model picker

@@ -164,6 +164,8 @@ pub async fn run_tui(
         "/tools",
         "/notes",
         "/nodes",
+        "/cancel",
+        "/retry",
         "/report",
         "/memory",
         "/topology",

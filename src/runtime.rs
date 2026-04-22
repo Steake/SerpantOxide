@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -7,8 +6,8 @@ use crate::browser::NativeBrowserEngine;
 use crate::config::AppConfig;
 use crate::events::UiEvent;
 use crate::graph::{ShadowGraph, TopologySnapshot};
-use crate::llm::{LlmTelemetrySnapshot, NativeLLMEngine, OpenRouterModel};
-use crate::notes::{Note, NotesEngine};
+use crate::llm::{LlmTelemetrySnapshot, NativeLLMEngine};
+use crate::notes::NotesEngine;
 use crate::orchestrator::Orchestrator;
 use crate::pool::{ToolRecord, WorkerInfo, WorkerPool};
 use crate::prompts;
@@ -50,18 +49,9 @@ struct RuntimeUiState {
 pub struct RuntimeWorkerSnapshot {
     pub id: String,
     pub task: String,
-    pub command: String,
     pub status: String,
-    pub logs: Vec<String>,
     pub loot: Vec<String>,
-    pub result: Option<String>,
-    pub error: Option<String>,
-    pub tools_used: Vec<String>,
     pub tool_history: Vec<ToolRecord>,
-    pub priority: i64,
-    pub depends_on: Vec<String>,
-    pub started_at: Option<u64>,
-    pub finished_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,7 +72,6 @@ pub struct RuntimeSnapshot {
     pub workers: Vec<RuntimeWorkerSnapshot>,
     pub topology: TopologySnapshot,
     pub note_categories: Vec<RuntimeNoteCategory>,
-    pub notes_by_category: HashMap<String, Vec<Note>>,
     pub latest_report: Option<String>,
     pub last_crew_summary: Option<String>,
     pub shutdown_requested: bool,
@@ -93,18 +82,9 @@ impl From<&WorkerInfo> for RuntimeWorkerSnapshot {
         Self {
             id: value.id.clone(),
             task: value.task.clone(),
-            command: value.command.clone(),
             status: value.status.clone(),
-            logs: value.logs.clone(),
             loot: value.loot.clone(),
-            result: value.result.clone(),
-            error: value.error.clone(),
-            tools_used: value.tools_used.clone(),
             tool_history: value.tool_history.clone(),
-            priority: value.priority,
-            depends_on: value.depends_on.clone(),
-            started_at: value.started_at,
-            finished_at: value.finished_at,
         }
     }
 }
@@ -273,7 +253,6 @@ impl RuntimeService {
             .into_iter()
             .map(|(name, count)| RuntimeNoteCategory { name, count })
             .collect();
-        let notes_by_category = self.notes_engine.all_notes().await;
 
         RuntimeSnapshot {
             target,
@@ -284,7 +263,6 @@ impl RuntimeService {
             workers,
             topology,
             note_categories,
-            notes_by_category,
             latest_report: ui_state.latest_report,
             last_crew_summary: ui_state.last_crew_summary,
             shutdown_requested: ui_state.shutdown_requested,
@@ -705,8 +683,27 @@ pub fn parse_slash_command(input: &str) -> Result<RuntimeCommand, String> {
         "/notes" | "/nodes" => Ok(RuntimeCommand::OpenNotes {
             category: parts.get(1).map(|value| value.to_string()),
         }),
+        "/cancel" => {
+            if parts.len() <= 1 {
+                Err("Usage: /cancel <worker-id>".to_string())
+            } else {
+                Ok(RuntimeCommand::CancelWorker {
+                    worker_id: parts[1].to_string(),
+                })
+            }
+        }
+        "/retry" => {
+            if parts.len() <= 1 {
+                Err("Usage: /retry <worker-id>".to_string())
+            } else {
+                Ok(RuntimeCommand::RetryWorker {
+                    worker_id: parts[1].to_string(),
+                })
+            }
+        }
         "/memory" => Ok(RuntimeCommand::ShowMemory),
         "/prompt" => Ok(RuntimeCommand::ShowPromptPreview),
+        "/topology" => Ok(RuntimeCommand::ShowTopology),
         "/report" => Ok(RuntimeCommand::GenerateReport),
         "/agent" => {
             if parts.len() <= 1 {
@@ -742,14 +739,6 @@ pub fn parse_operator_input(input: &str) -> Result<RuntimeCommand, String> {
             task: trimmed.to_string(),
         })
     }
-}
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn runtime_models_to_options(models: &[OpenRouterModel]) -> Vec<String> {
-    models
-        .iter()
-        .map(|model| format!("{} ({})", model.name, model.id))
-        .collect()
 }
 
 #[cfg(test)]
@@ -806,6 +795,34 @@ mod tests {
     fn rejects_missing_target_argument() {
         let error = parse_slash_command("/target").unwrap_err();
         assert!(error.contains("Usage"));
+    }
+
+    #[test]
+    fn parses_cancel_command() {
+        let command = parse_slash_command("/cancel agent-1").unwrap();
+        assert_eq!(
+            command,
+            RuntimeCommand::CancelWorker {
+                worker_id: "agent-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_retry_command() {
+        let command = parse_slash_command("/retry agent-1").unwrap();
+        assert_eq!(
+            command,
+            RuntimeCommand::RetryWorker {
+                worker_id: "agent-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_topology_command() {
+        let command = parse_slash_command("/topology").unwrap();
+        assert_eq!(command, RuntimeCommand::ShowTopology);
     }
 
     #[test]
