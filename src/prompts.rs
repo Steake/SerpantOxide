@@ -73,6 +73,7 @@ pub fn build_crew_prompt(
     insights: &[String],
     current_plan: &[String],
     worker_status: &[String],
+    readiness_lines: &[String],
 ) -> String {
     let insights_block = if insights.is_empty() {
         "- No prior findings yet.".to_string()
@@ -130,6 +131,16 @@ pub fn build_crew_prompt(
             .join("\n")
     };
 
+    let readiness_block = if readiness_lines.is_empty() {
+        "- No runtime readiness snapshot available.".to_string()
+    } else {
+        readiness_lines
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         r#"You are the lead of an authorized penetration testing crew. Coordinate multiple workers with maximum parallelism.
 
@@ -169,6 +180,9 @@ Continuation Priorities:
 Suggested Follow-Up Moves:
 {follow_up_block}
 
+Execution Readiness:
+{readiness_block}
+
 Crew tools:
 - spawn_agent(task, priority?, depends_on?): Launch a worker. Provide a concrete natural-language task. Prefixes like NMAP:, SQLMAP:, BROWSER:, SEARCH:, TERMINAL: are optional when you need to force a specific tool path.
 - spawn_parallel_agents(agents[]): Launch several workers in one batch. Prefer this for the initial recon spread and any set of independent subtasks.
@@ -185,6 +199,10 @@ Critical constraints:
 - Your first orchestration turn must publish a checklist with update_plan before worker execution begins.
 - Prefer spawn_parallel_agents for the first batch instead of dribbling out one worker at a time.
 - A normal first pass should launch several independent workers before any wait step, unless the mission truly has only one viable thread.
+- Bias toward tasks that can run with the current execution readiness and observed evidence.
+- Prefer installed native tools and supported browser actions before improvising terminal-heavy detours.
+- Do not invent custom exploit code or rely on ad hoc package installation. Use available capabilities, validate with evidence, and record blockers when a needed dependency is absent.
+- If a tool is mock-backed or unavailable, treat it as weak evidence and pivot to a higher-confidence path when possible.
 - Use SEARCH only for target-specific intelligence, not generic tutorials.
 - Prefer action-oriented tasks with concrete targets.
 - Do not stop after first-pass recon if discoveries reveal a stronger next step.
@@ -199,7 +217,12 @@ Critical constraints:
     )
 }
 
-pub fn build_worker_prompt(task: &str, mission: &MissionProfile, plan_lines: &[String]) -> String {
+pub fn build_worker_prompt(
+    task: &str,
+    mission: &MissionProfile,
+    plan_lines: &[String],
+    readiness_lines: &[String],
+) -> String {
     let plan_block = if plan_lines.is_empty() {
         "- No plan generated yet.".to_string()
     } else {
@@ -220,6 +243,16 @@ pub fn build_worker_prompt(task: &str, mission: &MissionProfile, plan_lines: &[S
         .map(|(idx, item)| format!("{}. {}", idx + 1, item))
         .collect::<Vec<_>>()
         .join("\n");
+
+    let readiness_block = if readiness_lines.is_empty() {
+        "- No runtime readiness snapshot available.".to_string()
+    } else {
+        readiness_lines
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     format!(
         r#"You are Serpantoxide WorkerAgent, an autonomous penetration testing specialist.
@@ -242,6 +275,9 @@ Discovery Summary:
 Heuristic Basis:
 {basis_block}
 
+Execution Readiness:
+{readiness_block}
+
 Workflow:
 1. Follow the current plan.
 2. Use tools to make progress.
@@ -253,6 +289,10 @@ Workflow:
 Rules:
 - Do not ask the operator questions.
 - Use notes(action="create", ...) for findings that matter to the wider crew.
+- Bias toward steps that are likely to work with the current readiness snapshot and observed evidence.
+- Prefer installed native tools, supported browser actions, and concrete shell verification before improvising.
+- Do not invent custom exploit code or ad hoc package installation. Use available capabilities, validate with evidence, and log blockers or pivots if a needed dependency is absent.
+- If a capability is mock-backed or unavailable, treat its output as low-confidence and seek a stronger confirmation path.
 - Prefer concrete actions over narration.
 - Web search is only for target-specific intelligence, not general tutorials.
 - Finish only when the desired outcome is achieved or no materially better next action remains.

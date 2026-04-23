@@ -1,4 +1,5 @@
 mod browser;
+mod capabilities;
 mod config;
 mod events;
 mod evm_chain;

@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
 
 use crate::browser::NativeBrowserEngine;
+use crate::capabilities;
 use crate::config::AppConfig;
 use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
@@ -231,18 +232,11 @@ impl Orchestrator {
                     .join(", ")
             ));
         }
-        if self.browser.is_some() {
-            augmented_insights
-                .push("Native browser engine is available for web interaction.".to_string());
-        } else {
-            augmented_insights.push(
-                "Read-only browser fallback is available for navigate/get_content/get_links/get_forms. Screenshot, click, type, and execute_js require Chromium.".to_string(),
-            );
-        }
-        if !self.search.api_key().is_empty() {
-            augmented_insights.push("Web intelligence search is available.".to_string());
-        }
         let worker_status = self.worker_status_lines().await;
+        let readiness = capabilities::crew_readiness_lines(
+            self.browser.is_some(),
+            !self.search.api_key().is_empty(),
+        );
 
         prompts::build_crew_prompt(
             target,
@@ -251,6 +245,7 @@ impl Orchestrator {
             &augmented_insights,
             current_plan,
             &worker_status,
+            &readiness,
         )
     }
 

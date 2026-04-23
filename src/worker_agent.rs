@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::browser::{NativeBrowserEngine, ReadOnlyBrowserFallback};
+use crate::capabilities;
 use crate::events::UiEvent;
 use crate::graph::ShadowGraph;
 use crate::llm::{ChatResponse, NativeLLMEngine, ToolCall};
@@ -197,7 +198,21 @@ impl WorkerAgent {
 
     pub async fn run(&self, task: &str, handle: &WorkerHandle) -> Result<String, String> {
         let mut mission = self.build_mission_profile(task).await;
-        let mut plan = self.generate_plan(task, &mission).await?;
+        let readiness = capabilities::worker_readiness_lines(
+            self.browser.is_some(),
+            !self.search.api_key().is_empty(),
+        );
+        handle
+            .log(format!(
+                "Execution readiness:\n{}",
+                readiness
+                    .iter()
+                    .map(|line| format!("- {}", line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+            .await;
+        let mut plan = self.generate_plan(task, &mission, &readiness).await?;
         let mut applied_follow_ups = HashSet::new();
         if plan.is_empty() {
             plan.push(PlanStep {
@@ -252,6 +267,7 @@ impl WorkerAgent {
                 task,
                 &mission,
                 &plan.iter().map(PlanStep::as_line).collect::<Vec<_>>(),
+                &readiness,
             );
             let response = self
                 .llm
@@ -296,7 +312,7 @@ impl WorkerAgent {
             }
 
             if plan_has_failure(&plan) {
-                let replanned = self.replan(task, &mission, &plan).await?;
+                let replanned = self.replan(task, &mission, &plan, &readiness).await?;
                 handle
                     .log(format!(
                         "Replanned:\n{}",
@@ -321,15 +337,16 @@ impl WorkerAgent {
         &self,
         task: &str,
         mission: &MissionProfile,
+        readiness: &[String],
     ) -> Result<Vec<PlanStep>, String> {
         let response = self
             .llm
             .generate_with_tools(
-                "You create concise penetration testing plans. Always call create_plan.",
+                "You create concise penetration testing plans. Bias toward steps that are likely to work with the current readiness snapshot. Always call create_plan.",
                 vec![json!({
                     "role": "user",
                     "content": format!(
-                        "Break this pentest task into 2-4 actionable steps.\nTask: {}\n\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\nHeuristic basis:\n{}",
+                        "Break this pentest task into 2-4 actionable steps.\nTask: {}\n\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\nHeuristic basis:\n{}\n\nExecution readiness:\n{}",
                         task,
                         mission.preset_title,
                         mission.resolved_preset,
@@ -337,6 +354,11 @@ impl WorkerAgent {
                         mission.discovery_summary,
                         mission
                             .heuristic_basis
+                            .iter()
+                            .map(|item| format!("- {}", item))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        readiness
                             .iter()
                             .map(|item| format!("- {}", item))
                             .collect::<Vec<_>>()
@@ -916,6 +938,7 @@ impl WorkerAgent {
         task: &str,
         mission: &MissionProfile,
         current_plan: &[PlanStep],
+        readiness: &[String],
     ) -> Result<Vec<PlanStep>, String> {
         let failed_step = current_plan
             .iter()
@@ -929,11 +952,11 @@ impl WorkerAgent {
         let response = self
             .llm
             .generate_with_tools(
-                "You are a tactical replanning assistant. Always call create_plan with a revised plan or feasible=false.",
+                "You are a tactical replanning assistant. Bias toward revised steps that are likely to work with the current readiness snapshot. Always call create_plan with a revised plan or feasible=false.",
                 vec![json!({
                     "role": "user",
                     "content": format!(
-                        "The worker plan failed.\nTask: {}\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\nFailed step: {}\nFailure detail: {}\nPrevious plan:\n{}",
+                        "The worker plan failed.\nTask: {}\nMission preset: {} ({})\nDesired outcome: {}\nDiscovery summary: {}\nFailed step: {}\nFailure detail: {}\nExecution readiness:\n{}\nPrevious plan:\n{}",
                         task,
                         mission.preset_title,
                         mission.resolved_preset,
@@ -941,6 +964,11 @@ impl WorkerAgent {
                         mission.discovery_summary,
                         failed_step.description,
                         failed_step.result.clone().unwrap_or_default(),
+                        readiness
+                            .iter()
+                            .map(|item| format!("- {}", item))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                         prior_plan
                     )
                 })],
