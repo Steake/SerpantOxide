@@ -27,10 +27,11 @@ Serpantoxide is the opposite design instinct: fewer illusions, harder edges, bet
 
 - A live terminal UI with telemetry, worker logs, topology views, inspection panes, and report generation.
 - An experimental native macOS shell built on the same runtime.
-- A crew orchestrator that can plan, spawn, monitor, and synthesise multiple workers.
+- A mission-aware crew orchestrator that can infer intent, publish a checklist, spawn, monitor, and synthesise multiple workers.
 - Worker agents that operate as iterative tool-calling loops rather than decorative one-shot prompts.
 - Native tools for `terminal`, `browser`, `web_search`, `notes`, `nmap`, `sqlmap`, `osint`, `hosting`, `image_gen`, and `evm_chain`.
 - Persistent findings in `loot/notes.json`.
+- Prompt history, target-aware autocomplete, shared operator note storage, and persisted mission/config state.
 - A lightweight graph model that turns findings into something closer to intelligence.
 - Deterministic mock mode when provider keys are absent, because pretending otherwise would be vulgar.
 
@@ -71,6 +72,12 @@ That separation matters. The orchestrator is there to think at a level above a s
 cargo run
 ```
 
+If startup goes sideways before the UI appears, inspect:
+
+```bash
+tail -n 80 /tmp/serpantoxide-startup.log
+```
+
 ### Frontends
 
 ```bash
@@ -96,16 +103,30 @@ scripts/package_macos_app.sh --target x86_64-apple-darwin --zip
 ```text
 /agent <task>        Run a focused autonomous assessment
 /crew <task>         Run multi-agent crew mode
+/preset [name]       Show or select a mission preset
+/presets             List mission presets
 /target <host>       Set the active target
 /tools               Show worker capabilities
 /notes [category]    Show stored findings
+/store <cat> <text>  Store an operator note in shared knowledge
+/config              Show runtime config
+/config set ...      Update runtime config
 /memory              Show graph-derived intelligence
 /topology            Open the interactive topology explorer
 /prompt              Show the crew prompt
 /report              Generate a markdown report
+/models              Open the model picker
+/help                Show help
 /modes               Show mode and prefix help
 /quit                Exit
 ```
+
+The TUI prompt also supports:
+
+- freeform non-slash input as an implicit crew mission
+- multiline paste
+- `Up` and `Down` prompt history navigation
+- local slash completion and target-aware LLM ghost-text completion with `Tab`
 
 ## Tool Surface
 
@@ -140,6 +161,24 @@ EVM: <action and address/query>
 
 Serpantoxide stores local runtime state in `.serpantoxide_config`. If `OPENROUTER_API_KEY` is present, it uses OpenRouter. If it is absent, the runtime drops into deterministic mock behaviour. This is not a scam. It is simply the difference between a live provider and a rehearsal.
 
+Current persisted fields:
+
+```json
+{
+  "selected_model": "openai/gpt-4o",
+  "selected_preset": "auto",
+  "last_target": "example.org",
+  "max_iterations": 16
+}
+```
+
+You can inspect and update the runtime config from inside the app:
+
+```text
+/config
+/config set max_iterations 24
+```
+
 Typical configuration:
 
 ```bash
@@ -157,11 +196,13 @@ LLM_MODEL=openai/gpt-4o
 src/
   main.rs
   runtime.rs
+  startup_trace.rs
   tui.rs
   gpui_app.rs
   orchestrator.rs
   pool.rs
   worker_agent.rs
+  mission.rs
   llm.rs
   browser.rs
   notes.rs
@@ -180,7 +221,7 @@ src/
 
 ## Documentation
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md)
+- [docs/OPERATOR_RUNTIME_SPEC.md](./docs/OPERATOR_RUNTIME_SPEC.md)
 - [docs/OPERATIONS.md](./docs/OPERATIONS.md)
 - [docs/TOOL_REFERENCE.md](./docs/TOOL_REFERENCE.md)
 - [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)

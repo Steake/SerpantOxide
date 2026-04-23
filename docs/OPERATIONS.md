@@ -55,6 +55,18 @@ cargo fmt
 cargo check
 ```
 
+If startup appears to hang before the frontend paints, inspect:
+
+```bash
+tail -n 80 /tmp/serpantoxide-startup.log
+```
+
+Override the startup log path with:
+
+```bash
+SERPANTOXIDE_STARTUP_LOG=/path/to/serpantoxide-startup.log
+```
+
 ## Environment Variables
 
 ### LLM and search
@@ -80,7 +92,7 @@ ETHERSCAN_API_KEY=...
 
 ## Local Configuration
 
-Serpantoxide persists its selected model and last target to:
+Serpantoxide persists its selected model, selected preset, last target, and crew iteration budget to:
 
 ```text
 .serpantoxide_config
@@ -93,7 +105,9 @@ The format is plain JSON:
 ```json
 {
   "selected_model": "openai/gpt-4o",
-  "last_target": "example.org"
+  "selected_preset": "auto",
+  "last_target": "example.org",
+  "max_iterations": 16
 }
 ```
 
@@ -104,6 +118,8 @@ The format is plain JSON:
 ```text
 /agent <task>
 /crew <task>
+/preset [name]
+/presets
 /target <host>
 /topology
 /report
@@ -114,8 +130,11 @@ The format is plain JSON:
 ```text
 /tools
 /notes [category]
+/store <category> <content>
 /memory
 /prompt
+/config
+/config set max_iterations <number>
 /modes
 /help
 ```
@@ -167,8 +186,15 @@ The Rust console is no longer a keyboard-only sermon delivered by a machine to a
 - click a tool in the agent pane to inspect arguments and output
 - click the topology strip to open the topology explorer
 - use `/topology` to open the explorer directly in fullscreen mode
+- freeform non-slash prompt input launches crew mode directly
+- multiline paste is accepted as first-class input
+- `Up` and `Down` browse prompt history while the prompt is active
+- `Tab` accepts ghost-text completion
+- slash commands autocomplete locally and broader prompt completions can be suggested by the LLM
 
 The TUI is the supported CLI surface today.
+
+Crew mode now also publishes a visible checklist as part of the operator contract. If the model fails to do so on the first turn, the orchestrator re-prompts it before allowing worker execution to continue.
 
 ### GPUI Shell
 
@@ -195,6 +221,10 @@ If `OPENROUTER_API_KEY` is absent, the LLM engine enters deterministic mock mode
 - worker-loop verification
 
 It is not useful for real assessment work. One should not confuse a mannequin with a field operative.
+
+### Startup trace
+
+Early startup emits structured trace lines to both `stderr` and the startup log file until the frontend takes over. This is intentionally pre-TUI so hangs in browser launch, config load, or model refresh can be diagnosed without guessing.
 
 ### Partial native tool availability
 

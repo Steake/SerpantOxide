@@ -18,6 +18,7 @@ If a change violates one of these, it should face a presumption of guilt.
 
 - `src/main.rs`
 - `src/config.rs`
+- `src/startup_trace.rs`
 - `src/runtime.rs`
 
 ### UI and events
@@ -30,6 +31,7 @@ If a change violates one of these, it should face a presumption of guilt.
 
 - `src/llm.rs`
 - `src/prompts.rs`
+- `src/mission.rs`
 
 ### Orchestration
 
@@ -182,7 +184,7 @@ This is workable at current scale. It may become strained if policy, evaluation,
 If you change architecture materially, update:
 
 - `README.md`
-- `ARCHITECTURE.md`
+- `docs/OPERATOR_RUNTIME_SPEC.md`
 - `docs/TOOL_REFERENCE.md`
 - `docs/OPERATIONS.md`
 - `docs/macos-gpui-frontend-spec.md` when the native-shell behavior or rollout assumptions change
