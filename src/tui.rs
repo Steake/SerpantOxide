@@ -1,7 +1,7 @@
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, MouseButton, MouseEventKind,
+        Event, EventStream, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -315,6 +315,10 @@ pub async fn run_tui(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
                 .split(chunks[2]);
+
+            // ratatui styles do not erase old glyphs, so clear dynamic panes before repainting.
+            f.render_widget(Clear, body_chunks[0]);
+            f.render_widget(Clear, body_chunks[1]);
 
             let telemetry_title = if is_nav_mode {
                 " [NAV MODE] Execution Telemetry (Arrows to Scroll) "
@@ -1140,22 +1144,49 @@ pub async fn run_tui(
                                     );
                                 }
                             }
-                            KeyCode::Char('q') if input.trim().is_empty() && !show_topology_modal && !show_model_popup && active_report.is_none() && selected_agent_id.is_none() => break,
+                            KeyCode::Char('q') if key.modifiers.is_empty() && input.trim().is_empty() && !show_topology_modal && !show_model_popup && active_report.is_none() && selected_agent_id.is_none() => break,
                             KeyCode::Char(c) => {
                                 if show_topology_modal {
                                     if c == 'f' {
                                         topology_fullscreen = !topology_fullscreen;
                                     }
-                                } else if show_model_popup { popup_query.push(c); popup_cursor = 0; }
+                                } else if show_model_popup {
+                                    let edited = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        match c {
+                                            'w' | 'W' => delete_previous_word(&mut popup_query),
+                                            'u' | 'U' => clear_prompt_input(&mut popup_query),
+                                            _ => false,
+                                        }
+                                    } else {
+                                        popup_query.push(c);
+                                        true
+                                    };
+
+                                    if edited {
+                                        popup_cursor = 0;
+                                    }
+                                }
                                 else if !is_nav_mode {
-                                    clear_history_navigation(&mut history_cursor, &mut history_draft);
-                                    input.push(c);
-                                    update_prompt_suggestion(
-                                        &input,
-                                        &commands,
-                                        &mut suggestion_ghost,
-                                        &suggest_tx,
-                                    );
+                                    let edited = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        match c {
+                                            'w' | 'W' => delete_previous_word(&mut input),
+                                            'u' | 'U' => clear_prompt_input(&mut input),
+                                            _ => false,
+                                        }
+                                    } else {
+                                        input.push(c);
+                                        true
+                                    };
+
+                                    if edited {
+                                        clear_history_navigation(&mut history_cursor, &mut history_draft);
+                                        update_prompt_suggestion(
+                                            &input,
+                                            &commands,
+                                            &mut suggestion_ghost,
+                                            &suggest_tx,
+                                        );
+                                    }
                                 }
                             },
                             KeyCode::Backspace => {
@@ -2245,6 +2276,29 @@ fn push_input_history(input_history: &mut Vec<String>, input: &str) {
     }
 }
 
+fn delete_previous_word(input: &mut String) -> bool {
+    let original_len = input.len();
+
+    while input.chars().last().is_some_and(|ch| ch.is_whitespace()) {
+        input.pop();
+    }
+
+    while input.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+        input.pop();
+    }
+
+    input.len() != original_len
+}
+
+fn clear_prompt_input(input: &mut String) -> bool {
+    if input.is_empty() {
+        false
+    } else {
+        input.clear();
+        true
+    }
+}
+
 fn clear_history_navigation(history_cursor: &mut Option<usize>, history_draft: &mut String) {
     *history_cursor = None;
     history_draft.clear();
@@ -2491,6 +2545,28 @@ mod tests {
                 "/store finding admin".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn delete_previous_word_trims_spaces_and_last_word() {
+        let mut input = "NMAP: example.org   ".to_string();
+        assert!(delete_previous_word(&mut input));
+        assert_eq!(input, "NMAP: ");
+    }
+
+    #[test]
+    fn delete_previous_word_can_cross_newline_boundary() {
+        let mut input = "/crew first line\nsecond".to_string();
+        assert!(delete_previous_word(&mut input));
+        assert_eq!(input, "/crew first line\n");
+    }
+
+    #[test]
+    fn clear_prompt_input_reports_when_it_clears_text() {
+        let mut input = "/config set max_iterations 24".to_string();
+        assert!(clear_prompt_input(&mut input));
+        assert!(input.is_empty());
+        assert!(!clear_prompt_input(&mut input));
     }
 
     #[test]

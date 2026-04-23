@@ -1,6 +1,12 @@
 /target
 /.serpantoxide_config
 .env
+/loot/
+/tmp/
+/initial_scan.*
+/dig_results.txt
+/subdomains.txt
+/wordlist.txt
 scan_results.txt
 **/*.rs.bk
 .DS_Store
